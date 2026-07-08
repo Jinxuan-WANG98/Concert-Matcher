@@ -1,14 +1,16 @@
+import io
 import os
 import tempfile
 import unittest
 from pathlib import Path
 
 from openpyxl import load_workbook
+from werkzeug.datastructures import FileStorage
 
 from services.export_excel import write_matches_xlsx
 from services.models import EventRow, PlaylistArtist
 import services.pipeline as pipeline
-from services.pipeline import run_match_pipeline, run_match_pipeline_from_data
+from services.pipeline import run_match_pipeline, run_match_pipeline_from_data, save_uploaded_images
 
 
 class PipelineTest(unittest.TestCase):
@@ -81,6 +83,40 @@ class PipelineTest(unittest.TestCase):
             "AI \u590d\u6838\u672a\u542f\u7528\uff1a\u670d\u52a1\u5668\u6ca1\u6709\u914d\u7f6e AI API Key",
             " ".join(result.warnings),
         )
+
+    def test_save_uploaded_images_ignores_empty_file_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            upload_dir = Path(tmp)
+            empty = FileStorage(stream=io.BytesIO(b""), filename="", content_type="application/octet-stream")
+            paths = save_uploaded_images([empty], upload_dir)
+            self.assertEqual(paths, [])
+            self.assertEqual(list(upload_dir.iterdir()), [])
+
+    def test_save_uploaded_images_keeps_real_file_when_empty_input_present(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            upload_dir = Path(tmp)
+            image_bytes = io.BytesIO()
+            Image.new("RGB", (1, 1)).save(image_bytes, format="JPEG")
+            empty = FileStorage(stream=io.BytesIO(b""), filename="", content_type="application/octet-stream")
+            real = FileStorage(
+                stream=io.BytesIO(image_bytes.getvalue()),
+                filename="note.jpg",
+                content_type="image/jpeg",
+            )
+            paths = save_uploaded_images([empty, real], upload_dir)
+            self.assertEqual(len(paths), 1)
+            self.assertEqual(paths[0].name, "upload_01.jpg")
+            self.assertGreater(paths[0].stat().st_size, 0)
+
+    def test_save_uploaded_images_rejects_invalid_image_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            upload_dir = Path(tmp)
+            invalid = FileStorage(stream=io.BytesIO(b"not an image"), filename="bad.jpg", content_type="image/jpeg")
+            paths = save_uploaded_images([invalid], upload_dir)
+            self.assertEqual(paths, [])
+            self.assertEqual(list(upload_dir.iterdir()), [])
 
 
 if __name__ == "__main__":

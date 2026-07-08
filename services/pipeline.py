@@ -3,6 +3,8 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 
+from PIL import Image
+
 from services.ai_matcher import AiArtistReviewer, AiMatchConfig
 from services.export_excel import write_matches_xlsx
 from services.matcher import match_events_to_artists
@@ -82,12 +84,26 @@ def run_match_pipeline(
 def save_uploaded_images(files, upload_dir: Path) -> list[Path]:
     upload_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
-    for index, file in enumerate(files, start=1):
-        filename = getattr(file, "filename", "") or f"upload_{index}.jpg"
-        ext = Path(filename).suffix.lower()
+    saved_count = 0
+    for file in files:
+        raw_filename = (getattr(file, "filename", "") or "").strip()
+        if not raw_filename:
+            continue
+        ext = Path(raw_filename).suffix.lower()
         if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
             continue
-        path = upload_dir / f"upload_{index:02d}{ext}"
+        saved_count += 1
+        path = upload_dir / f"upload_{saved_count:02d}{ext}"
         file.save(path)
+        file_size = path.stat().st_size if path.exists() else -1
+        if file_size <= 0:
+            path.unlink(missing_ok=True)
+            continue
+        try:
+            with Image.open(path) as img:
+                img.verify()
+        except Exception:
+            path.unlink(missing_ok=True)
+            continue
         paths.append(path)
     return paths

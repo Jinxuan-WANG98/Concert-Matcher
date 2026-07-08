@@ -31,11 +31,12 @@ def api_match():
 
     if not netease_url:
         return jsonify({"error": "\u8bf7\u586b\u5199\u7f51\u6613\u4e91\u6b4c\u5355\u94fe\u63a5"}), 400
-    if not xhs_url and not uploaded_files:
-        return jsonify({"error": "\u8bf7\u586b\u5199\u5c0f\u7ea2\u4e66\u94fe\u63a5\uff0c\u6216\u4e0a\u4f20\u5c0f\u7ea2\u4e66\u56fe\u7247"}), 400
 
     upload_dir = OUTPUT_ROOT / "uploads" / uuid.uuid4().hex
     uploaded = save_uploaded_images(uploaded_files, upload_dir)
+
+    if not xhs_url and not uploaded:
+        return jsonify({"error": "\u8bf7\u586b\u5199\u5c0f\u7ea2\u4e66\u94fe\u63a5\uff0c\u6216\u4e0a\u4f20\u5c0f\u7ea2\u4e66\u56fe\u7247"}), 400
 
     try:
         result = run_match_pipeline(
