@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>&#28436;&#20986;&#21305;&#37197;&#22120;</title>
+    <link rel="stylesheet" href="../static/styles.css" />
+  </head>
+  <body>
+    <main class="page-shell">
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Playlist Concert Finder</p>
+          <h1>&#36817;&#26399;&#26377;&#20320;&#21916;&#27426;&#30340;&#27468;&#25163;&#22312;&#28436;&#20986;</h1>
+          <p class="subtitle">&#36755;&#20837;&#32593;&#26131;&#20113;&#27468;&#21333;&#21644;&#23567;&#32418;&#20070;&#28436;&#20986;&#25972;&#29702;&#38142;&#25509;&#65292;&#33258;&#21160;&#35782;&#21035;&#22270;&#29255;&#37324;&#30340;&#26085;&#26399;&#12289;&#27468;&#25163;&#21644;&#22330;&#22320;&#65292;&#20877;&#24110;&#20320;&#25214;&#20986;&#21916;&#27426;&#30340;&#27468;&#25163;&#12290;</p>
+        </div>
+        <div class="ticket-card" aria-hidden="true">
+          <span class="ticket-label">LIVE LIST</span>
+          <span class="ticket-main">Match</span>
+          <span class="ticket-sub">soft pink edition</span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <form id="match-form" class="match-form">
+          <label>
+            <span>&#32593;&#26131;&#20113;&#27468;&#21333;&#38142;&#25509;</span>
+            <input name="netease_url" type="url" placeholder="https://music.163.com/#/playlist?id=..." required />
+          </label>
+          <label>
+            <span>&#23567;&#32418;&#20070;&#31508;&#35760;&#38142;&#25509;</span>
+            <input name="xhs_url" type="url" placeholder="http://xhslink.com/..." />
+          </label>
+          <label class="upload-box">
+            <span>&#23567;&#32418;&#20070;&#22270;&#29255;&#20828;&#24213;&#19978;&#20256;</span>
+            <input name="images" type="file" accept="image/png,image/jpeg,image/webp" multiple />
+            <small>&#22914;&#26524;&#38142;&#25509;&#25235;&#21462;&#22833;&#36133;&#65292;&#21487;&#20197;&#30452;&#25509;&#19978;&#20256;&#31508;&#35760;&#25130;&#22270;&#25110;&#36718;&#25773;&#22270;&#12290;</small>
+          </label>
+          <label class="switch-card">
+            <input name="use_ai" type="checkbox" />
+            <span class="switch-ui" aria-hidden="true"></span>
+            <span>
+              <strong>AI &#22797;&#26680;</strong>
+              <small>&#21487;&#36873;&#65306;&#29992; AI &#20877;&#26816;&#26597;&#20013;&#31561;&#32622;&#20449;&#30340;&#27468;&#25163;&#21305;&#37197;&#12290;&#38656;&#35201;&#22312;&#37096;&#32626;&#26102;&#37197;&#32622; API Key&#12290;</small>
+            </span>
+          </label>
+          <button type="submit" id="submit-button">&#24320;&#22987;&#21305;&#37197;</button>
+        </form>
+      </section>
+
+      <section id="file-warning" class="status-panel hidden" role="alert"></section>
+      <section id="status" class="status-panel hidden" role="status"></section>
+
+      <section id="result-panel" class="results hidden">
+        <div class="result-heading">
+          <div>
+            <p class="eyebrow">Result</p>
+            <h2>&#36817;&#26399;&#26377;&#20320;&#21916;&#27426;&#30340;&#27468;&#25163;&#22312;&#28436;&#20986;&#65306;</h2>
+          </div>
+          <a id="download-link" class="download-link hidden" href="#">&#19979;&#36733; Excel</a>
+        </div>
+        <div id="warnings" class="warnings hidden"></div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>&#24207;&#21495;</th>
+                <th>&#26085;&#26399;</th>
+                <th>&#27468;&#25163;</th>
+                <th>&#28436;&#20986;&#22330;&#25152;</th>
+                <th>&#27468;&#21333;&#20986;&#29616;&#27425;&#25968;</th>
+                <th>&#27468;&#21333;&#20195;&#34920;&#27468;&#26354;</th>
+                <th>&#32622;&#20449;&#24230;</th>
+              </tr>
+            </thead>
+            <tbody id="results-body"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+    <script src="../static/app.js"></script>
+  </body>
+</html>
