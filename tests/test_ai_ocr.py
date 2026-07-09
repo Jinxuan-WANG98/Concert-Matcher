@@ -31,6 +31,7 @@ class AiOcrTest(unittest.TestCase):
             "AI_OCR_MAX_WIDTH",
             "AI_OCR_IMAGE_BATCH_SIZE",
             "AI_OCR_IMAGE_WORKERS",
+            "AI_OCR_LOCAL_FALLBACK",
             "AI_OCR_MIN_AGREEMENT_RATIO",
             "AI_OCR_MIN_EVENTS",
         ]
@@ -188,7 +189,7 @@ class AiOcrTest(unittest.TestCase):
             ],
         )
 
-    def test_select_ai_ocr_events_rejects_conflicting_provider_results(self):
+    def test_select_ai_ocr_events_merges_distributed_provider_results_without_agreement(self):
         siliconflow = AiOcrProviderResult(
             provider_name="siliconflow",
             events=[
@@ -204,11 +205,21 @@ class AiOcrTest(unittest.TestCase):
             ],
         )
 
-        self.assertEqual(select_ai_ocr_events([siliconflow, zhipu]), [])
+        selected = select_ai_ocr_events([siliconflow, zhipu])
+
+        self.assertEqual(
+            [(event.date_text, event.performer) for event in selected],
+            [
+                ("7.11", "Thomas Bergersen"),
+                ("7.12", "Hanser"),
+                ("9.24", "DAKOOKA"),
+                ("10.3", "\u91cd\u8fd4\u672a\u6765\uff1a1999"),
+            ],
+        )
 
     def test_extract_events_with_ai_ocr_uses_friendly_warning_for_forbidden_provider(self):
         old_values = self._clear_ai_ocr_env()
-        original_extract = ai_ocr.AiOcrClient.extract_events
+        original_extract = ai_ocr.AiOcrClient._extract_batch_events
         warnings = []
         try:
             os.environ["AI_OCR_ENABLED"] = "true"
@@ -220,11 +231,11 @@ class AiOcrTest(unittest.TestCase):
             def forbidden_extract(self, image_paths):
                 raise HTTPError(url="https://api.example.com", code=403, msg="Forbidden", hdrs=None, fp=None)
 
-            ai_ocr.AiOcrClient.extract_events = forbidden_extract
+            ai_ocr.AiOcrClient._extract_batch_events = forbidden_extract
 
-            events = ai_ocr.extract_events_with_ai_ocr([], warnings)
+            events = ai_ocr.extract_events_with_ai_ocr([Path("note.jpg")], warnings)
         finally:
-            ai_ocr.AiOcrClient.extract_events = original_extract
+            ai_ocr.AiOcrClient._extract_batch_events = original_extract
             self._restore_env(old_values)
 
         self.assertEqual(events, [])
@@ -281,6 +292,89 @@ class AiOcrTest(unittest.TestCase):
         content = request_payloads[0]["messages"][1]["content"]
         image_parts = [part for part in content if part["type"] == "image_url"]
         self.assertEqual(len(image_parts), 3)
+
+    def test_client_repairs_malformed_ai_ocr_json_with_ai(self):
+        original_urlopen = ai_ocr.request.urlopen
+        request_payloads = []
+
+        class FakeResponse:
+            def __init__(self, content):
+                self.content = content
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                payload = {"choices": [{"message": {"content": self.content}}]}
+                return ai_ocr.json.dumps(payload).encode("utf-8")
+
+        responses = [
+            FakeResponse("events: date 7/11 performer PREP venue MAO"),
+            FakeResponse('{"events":[{"date_text":"7.11","performer":"PREP","venue":"MAO"}]}'),
+        ]
+
+        def fake_urlopen(req, timeout):
+            request_payloads.append(ai_ocr.json.loads(req.data.decode("utf-8")))
+            return responses.pop(0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "image.jpg"
+            Image.new("RGB", (10, 10)).save(image_path)
+            client = AiOcrClient(
+                AiOcrProviderConfig(
+                    name="test",
+                    api_key="key",
+                    base_url="https://api.example.com/v1",
+                    model="vision-model",
+                ),
+                timeout_seconds=1,
+                max_width=16,
+            )
+            ai_ocr.request.urlopen = fake_urlopen
+            try:
+                events = client.extract_events([image_path])
+            finally:
+                ai_ocr.request.urlopen = original_urlopen
+
+        self.assertEqual([(event.date_text, event.performer, event.venue) for event in events], [("7.11", "PREP", "MAO")])
+        self.assertEqual(len(request_payloads), 2)
+        self.assertIn("修复", request_payloads[1]["messages"][0]["content"])
+
+    def test_extract_events_with_ai_ocr_distributes_batches_across_providers(self):
+        old_values = self._clear_ai_ocr_env()
+        original_extract_batch = ai_ocr.AiOcrClient._extract_batch_events
+        calls = []
+        warnings = []
+        try:
+            os.environ["AI_OCR_ENABLED"] = "true"
+            os.environ["AI_OCR_IMAGE_BATCH_SIZE"] = "2"
+            os.environ["AI_OCR_PROVIDER_1_NAME"] = "siliconflow"
+            os.environ["AI_OCR_PROVIDER_1_API_KEY"] = "sf-key"
+            os.environ["AI_OCR_PROVIDER_1_BASE_URL"] = "https://api.example.com/v1"
+            os.environ["AI_OCR_PROVIDER_1_MODEL"] = "sf-vl"
+            os.environ["AI_OCR_PROVIDER_2_NAME"] = "zhipu"
+            os.environ["AI_OCR_PROVIDER_2_API_KEY"] = "zp-key"
+            os.environ["AI_OCR_PROVIDER_2_BASE_URL"] = "https://api.example.com/v1"
+            os.environ["AI_OCR_PROVIDER_2_MODEL"] = "zp-vl"
+
+            def fake_extract_batch(self, batch):
+                calls.append((self.provider.name, [path.name for path in batch]))
+                return [EventRow(date_text="7.11", performer=self.provider.name, venue="", image_name="+".join(path.name for path in batch))]
+
+            ai_ocr.AiOcrClient._extract_batch_events = fake_extract_batch
+            image_paths = [Path(f"image_{index}.jpg") for index in range(4)]
+
+            events = ai_ocr.extract_events_with_ai_ocr(image_paths, warnings)
+        finally:
+            ai_ocr.AiOcrClient._extract_batch_events = original_extract_batch
+            self._restore_env(old_values)
+
+        self.assertEqual([call[0] for call in calls], ["siliconflow", "zhipu"])
+        self.assertEqual([event.performer for event in events], ["siliconflow", "zhipu"])
+        self.assertIn("分批并行", " ".join(warnings))
 
 
 if __name__ == "__main__":

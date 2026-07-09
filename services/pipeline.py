@@ -137,6 +137,11 @@ def _load_events_for_uploaded_images(
                 warnings.append("AI 识别已用于图片读取。")
             save_uploaded_event_cache(image_paths, ai_config.cache_source, ai_events, output_root=output_root)
             return ai_events
+        if not ai_config.local_fallback_enabled:
+            if len(warnings) == warning_count:
+                warnings.append("AI 识别未返回可用行，未自动调用本地 OCR。")
+            return []
+        warnings.append("AI 识别未返回可用行，已按配置回退本地 OCR。")
         if len(warnings) == warning_count:
             warnings.append("AI 识别未返回可用行，已回退本地 OCR。")
 
@@ -196,6 +201,11 @@ def _load_events_for_xhs(
                 warnings.append("AI 识别已用于图片读取。")
             save_xhs_event_cache(xhs_url, note_image_urls, ai_config.cache_source, ai_events, output_root=output_root)
             return ai_events
+        if not ai_config.local_fallback_enabled:
+            if len(warnings) == warning_count:
+                warnings.append("AI 识别未返回可用行，未自动调用本地 OCR。")
+            return []
+        warnings.append("AI 识别未返回可用行，已按配置回退本地 OCR。")
         if len(warnings) == warning_count:
             warnings.append("AI 识别未返回可用行，已回退本地 OCR。")
         if cached_local_events is not None:
@@ -266,7 +276,7 @@ def run_match_pipeline(
     if use_ai:
         ai_config = AiMatchConfig.from_env()
         if ai_config.enabled:
-            ai_reviewer = _SafeAiReviewer(AiArtistReviewer(ai_config), warnings)
+            ai_reviewer = _SafeAiReviewer(AiArtistReviewer(ai_config, output_root=output_root), warnings)
             ai_only = ai_config.mode == "ai_only"
         else:
             warnings.append(

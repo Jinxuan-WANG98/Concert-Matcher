@@ -3,11 +3,15 @@ from __future__ import annotations
 import json
 import os
 import socket
+import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib import request
 
 from services.models import EventRow, PlaylistArtist
+from services.ocr_cache import cache_enabled, cache_root
 
 
 @dataclass(frozen=True)
@@ -34,6 +38,7 @@ class AiMatchConfig:
     candidate_limit: int = 120
     mode: str = "review"
     event_batch_size: int = 30
+    event_workers: int = 3
 
     @classmethod
     def from_env(cls) -> "AiMatchConfig":
@@ -61,8 +66,13 @@ class AiMatchConfig:
             timeout_seconds=int(os.environ.get("AI_MATCH_TIMEOUT_SECONDS", "20")),
             candidate_limit=int(os.environ.get("AI_MATCH_CANDIDATE_LIMIT", "120")),
             mode=mode,
-            event_batch_size=int(os.environ.get("AI_MATCH_EVENT_BATCH_SIZE", "30")),
+            event_batch_size=max(1, int(os.environ.get("AI_MATCH_EVENT_BATCH_SIZE", "30"))),
+            event_workers=max(1, int(os.environ.get("AI_MATCH_EVENT_WORKERS", "3"))),
         )
+
+    @property
+    def cache_source(self) -> str:
+        return f"ai-match:v2:{self.base_url}:{self.model}:c{self.candidate_limit}:mode{self.mode}"
 
 
 def build_review_payload(event: EventRow, artist: PlaylistArtist, model: str = "gpt-4.1-mini") -> dict[str, Any]:
@@ -195,6 +205,30 @@ def build_batch_artist_pick_payload(
     }
 
 
+def build_ai_match_repair_payload(model: str, raw_text: str, schema: str) -> dict[str, Any]:
+    system = (
+        "你是 JSON 修复器。只修复格式，不新增、推测或改写原始输出里没有的匹配判断。"
+        "把输入整理成程序可解析的严格 JSON。"
+    )
+    prompt = (
+        f"请把下面的 AI 匹配原始输出修复为严格 JSON，格式只能是：{schema}\n"
+        "规则：\n"
+        "1. 只能使用原始输出里已经出现的匹配判断。\n"
+        "2. artist_name 不确定时用 null。\n"
+        "3. confidence 只能是 高、中、低。\n"
+        "4. 不要返回 Markdown，不要解释，只返回 JSON。\n"
+        f"原始输出：\n{raw_text}"
+    )
+    return {
+        "model": model,
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+    }
+
+
 def _strip_json_fence(raw_text: str) -> str:
     text = str(raw_text or "").strip()
     if text.startswith("```"):
@@ -283,9 +317,149 @@ def parse_ai_batch_match_suggestions(raw_text: str) -> dict[int, AiMatchSuggesti
     return suggestions
 
 
+MATCH_CACHE_VERSION = 1
+
+
+def _match_cache_fingerprint(
+    events: list[EventRow],
+    artists: list[PlaylistArtist],
+    cache_source: str,
+) -> str:
+    payload = {
+        "source": cache_source,
+        "events": [
+            {
+                "date_text": event.date_text,
+                "performer": event.performer,
+                "venue": event.venue,
+            }
+            for event in events
+        ],
+        "artists": [
+            {
+                "name": artist.name,
+                "song_count": artist.song_count,
+                "sample_songs": artist.sample_songs[:5],
+            }
+            for artist in artists
+        ],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _match_cache_path(
+    events: list[EventRow],
+    artists: list[PlaylistArtist],
+    cache_source: str,
+    output_root: Path | None,
+) -> Path:
+    fingerprint = _match_cache_fingerprint(events, artists, cache_source)
+    return cache_root(output_root) / f"ai-match-{fingerprint}.json"
+
+
+def _suggestion_to_dict(suggestion: AiMatchSuggestion) -> dict[str, str]:
+    return {
+        "artist_name": suggestion.artist_name,
+        "confidence": suggestion.confidence,
+        "reason": suggestion.reason,
+    }
+
+
+def _suggestion_from_dict(data: dict[str, Any]) -> AiMatchSuggestion:
+    return AiMatchSuggestion(
+        artist_name=str(data["artist_name"]),
+        confidence=str(data["confidence"]),
+        reason=str(data.get("reason", "")),
+    )
+
+
+def _load_match_cache(
+    events: list[EventRow],
+    artists: list[PlaylistArtist],
+    cache_source: str,
+    output_root: Path | None,
+) -> dict[int, AiMatchSuggestion] | None:
+    if output_root is None or not cache_enabled():
+        return None
+
+    path = _match_cache_path(events, artists, cache_source, output_root)
+    if not path.exists():
+        return None
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    if payload.get("cache_version") != MATCH_CACHE_VERSION:
+        return None
+    if payload.get("cache_source") != cache_source:
+        return None
+    expected_fingerprint = _match_cache_fingerprint(events, artists, cache_source)
+    if payload.get("fingerprint") != expected_fingerprint:
+        return None
+
+    raw_suggestions = payload.get("suggestions", {})
+    if not isinstance(raw_suggestions, dict):
+        return None
+    try:
+        return {int(index): _suggestion_from_dict(value) for index, value in raw_suggestions.items()}
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def _save_match_cache(
+    events: list[EventRow],
+    artists: list[PlaylistArtist],
+    cache_source: str,
+    suggestions: dict[int, AiMatchSuggestion],
+    output_root: Path | None,
+) -> None:
+    if output_root is None or not cache_enabled():
+        return
+
+    cache_dir = cache_root(output_root)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    fingerprint = _match_cache_fingerprint(events, artists, cache_source)
+    payload = {
+        "cache_version": MATCH_CACHE_VERSION,
+        "cache_source": cache_source,
+        "fingerprint": fingerprint,
+        "suggestions": {
+            str(index): _suggestion_to_dict(suggestion) for index, suggestion in sorted(suggestions.items())
+        },
+    }
+    _match_cache_path(events, artists, cache_source, output_root).write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _chunked(items: list[Any], size: int) -> list[list[Any]]:
+    return [items[index : index + size] for index in range(0, len(items), size)]
+
+
+def _confidence_rank(value: str) -> int:
+    return {"\u9ad8": 3, "\u4e2d": 2, "\u4f4e": 1}.get(value, 0)
+
+
+def _merge_suggestions(
+    current: dict[int, AiMatchSuggestion],
+    new: dict[int, AiMatchSuggestion],
+) -> dict[int, AiMatchSuggestion]:
+    merged = dict(current)
+    for index, suggestion in new.items():
+        existing = merged.get(index)
+        if existing is None or _confidence_rank(suggestion.confidence) > _confidence_rank(existing.confidence):
+            merged[index] = suggestion
+    return merged
+
+
 class AiArtistReviewer:
-    def __init__(self, config: AiMatchConfig | None = None):
+    def __init__(self, config: AiMatchConfig | None = None, output_root: Path | None = None):
         self.config = config or AiMatchConfig.from_env()
+        self.output_root = output_root
 
     def _chat_content(self, payload: dict[str, Any]) -> str:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -302,12 +476,23 @@ class AiArtistReviewer:
             result = json.loads(response.read().decode("utf-8"))
         return result["choices"][0]["message"]["content"]
 
+    def _parse_with_ai_repair(self, raw_text: str, parser, schema: str):
+        try:
+            return parser(raw_text)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            payload = build_ai_match_repair_payload(self.config.model, raw_text, schema)
+            return parser(self._chat_content(payload))
+
     def review(self, event: EventRow, artist: PlaylistArtist) -> AiDecision | None:
         if not self.config.enabled:
             return None
 
         payload = build_review_payload(event, artist, model=self.config.model)
-        return parse_ai_decision(self._chat_content(payload))
+        return self._parse_with_ai_repair(
+            self._chat_content(payload),
+            parse_ai_decision,
+            '{"is_match": boolean, "confidence": "高|中|低", "reason": string}',
+        )
 
     def find_best_match(self, event: EventRow, artists: list[PlaylistArtist]) -> AiMatchSuggestion | None:
         if not self.config.enabled or not artists:
@@ -319,20 +504,63 @@ class AiArtistReviewer:
             model=self.config.model,
             candidate_limit=self.config.candidate_limit,
         )
-        return parse_ai_match_suggestion(self._chat_content(payload))
+        return self._parse_with_ai_repair(
+            self._chat_content(payload),
+            parse_ai_match_suggestion,
+            '{"artist_name": string|null, "confidence": "高|中|低", "reason": string}',
+        )
 
     def find_best_matches(self, events: list[EventRow], artists: list[PlaylistArtist]) -> dict[int, AiMatchSuggestion]:
         if not self.config.enabled or not events or not artists:
             return {}
 
+        cached = _load_match_cache(events, artists, self.config.cache_source, self.output_root)
+        if cached is not None:
+            return cached
+
         batch_size = max(1, self.config.event_batch_size)
+        batches = [(start_index, batch) for start_index, batch in enumerate(_chunked(events, batch_size))]
+        batches = [(index * batch_size, batch) for index, batch in batches]
         suggestions: dict[int, AiMatchSuggestion] = {}
-        for start_index in range(0, len(events), batch_size):
-            batch = events[start_index : start_index + batch_size]
-            suggestions.update(self._find_best_matches_batch(batch, artists, start_index=start_index))
+        worker_count = min(max(1, self.config.event_workers), len(batches))
+        if worker_count <= 1:
+            for start_index, batch in batches:
+                suggestions = _merge_suggestions(
+                    suggestions,
+                    self._find_best_matches_batch(batch, artists, start_index=start_index),
+                )
+            _save_match_cache(events, artists, self.config.cache_source, suggestions, self.output_root)
+            return suggestions
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(self._find_best_matches_batch, batch, artists, start_index): start_index
+                for start_index, batch in batches
+            }
+            for future in as_completed(futures):
+                suggestions = _merge_suggestions(suggestions, future.result())
+        _save_match_cache(events, artists, self.config.cache_source, suggestions, self.output_root)
         return suggestions
 
     def _find_best_matches_batch(
+        self,
+        events: list[EventRow],
+        artists: list[PlaylistArtist],
+        start_index: int,
+    ) -> dict[int, AiMatchSuggestion]:
+        candidate_batch_size = max(1, self.config.candidate_limit)
+        if len(artists) > candidate_batch_size:
+            suggestions: dict[int, AiMatchSuggestion] = {}
+            for artist_batch in _chunked(artists, candidate_batch_size):
+                suggestions = _merge_suggestions(
+                    suggestions,
+                    self._find_best_matches_batch_for_candidates(events, artist_batch, start_index=start_index),
+                )
+            return suggestions
+
+        return self._find_best_matches_batch_for_candidates(events, artists, start_index=start_index)
+
+    def _find_best_matches_batch_for_candidates(
         self,
         events: list[EventRow],
         artists: list[PlaylistArtist],
@@ -346,22 +574,45 @@ class AiArtistReviewer:
             start_index=start_index,
         )
         try:
-            return parse_ai_batch_match_suggestions(self._chat_content(payload))
+            return self._parse_with_ai_repair(
+                self._chat_content(payload),
+                parse_ai_batch_match_suggestions,
+                '{"matches":[{"event_index": number, "artist_name": string|null, "confidence": "高|中|低", "reason": string}]}',
+            )
         except Exception as exc:
             if not _is_timeout_error(exc):
                 raise
             if len(events) <= 1:
-                return {}
+                if len(artists) <= 1:
+                    return {}
+                midpoint = len(artists) // 2
+                suggestions = self._find_best_matches_batch_for_candidates(
+                    events,
+                    artists[:midpoint],
+                    start_index=start_index,
+                )
+                return _merge_suggestions(
+                    suggestions,
+                    self._find_best_matches_batch_for_candidates(
+                        events,
+                        artists[midpoint:],
+                        start_index=start_index,
+                    ),
+                )
             midpoint = len(events) // 2
-            suggestions = self._find_best_matches_batch(events[:midpoint], artists, start_index=start_index)
-            suggestions.update(
-                self._find_best_matches_batch(
+            suggestions = self._find_best_matches_batch_for_candidates(
+                events[:midpoint],
+                artists,
+                start_index=start_index,
+            )
+            return _merge_suggestions(
+                suggestions,
+                self._find_best_matches_batch_for_candidates(
                     events[midpoint:],
                     artists,
                     start_index=start_index + midpoint,
-                )
+                ),
             )
-            return suggestions
 
 
 def _is_timeout_error(exc: Exception) -> bool:

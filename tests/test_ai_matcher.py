@@ -1,6 +1,9 @@
 import json
 import os
+import tempfile
+import threading
 import unittest
+from pathlib import Path
 
 from services.ai_matcher import (
     AiDecision,
@@ -73,6 +76,27 @@ class AiMatcherTest(unittest.TestCase):
                     os.environ.pop(name, None)
 
         self.assertEqual(config.event_batch_size, 12)
+
+    def test_config_loads_event_workers(self):
+        old_values = {
+            "AI_MATCH_API_KEY": os.environ.pop("AI_MATCH_API_KEY", None),
+            "AI_MATCH_ENABLED": os.environ.pop("AI_MATCH_ENABLED", None),
+            "AI_MATCH_EVENT_WORKERS": os.environ.pop("AI_MATCH_EVENT_WORKERS", None),
+        }
+        try:
+            os.environ["AI_MATCH_ENABLED"] = "true"
+            os.environ["AI_MATCH_API_KEY"] = "test-key"
+            os.environ["AI_MATCH_EVENT_WORKERS"] = "4"
+
+            config = AiMatchConfig.from_env()
+        finally:
+            for name, value in old_values.items():
+                if value is not None:
+                    os.environ[name] = value
+                else:
+                    os.environ.pop(name, None)
+
+        self.assertEqual(config.event_workers, 4)
 
     def test_config_can_reuse_ocr_provider_key(self):
         names = [
@@ -209,6 +233,7 @@ class AiMatcherTest(unittest.TestCase):
             base_url="https://api.example.com/v1",
             model="text-model",
             event_batch_size=2,
+            event_workers=1,
         )
         reviewer = AiArtistReviewer(config)
         calls = []
@@ -243,6 +268,209 @@ class AiMatcherTest(unittest.TestCase):
         self.assertEqual(suggestions[1].artist_name, "PREP")
         self.assertEqual(suggestions[2].artist_name, "Hanser")
 
+    def test_reviewer_runs_event_batches_in_parallel(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+            event_batch_size=1,
+            event_workers=2,
+        )
+        reviewer = AiArtistReviewer(config)
+        lock = threading.Lock()
+        both_started = threading.Event()
+        active_count = 0
+        max_active_count = 0
+
+        def fake_batch(batch, artists, start_index):
+            nonlocal active_count, max_active_count
+            with lock:
+                active_count += 1
+                max_active_count = max(max_active_count, active_count)
+                if active_count == 2:
+                    both_started.set()
+            both_started.wait(timeout=1)
+            with lock:
+                active_count -= 1
+            return {
+                start_index: AiMatchSuggestion(
+                    artist_name=artists[start_index].name,
+                    confidence="\u9ad8",
+                    reason="\u5e76\u884c\u6279\u6b21",
+                )
+            }
+
+        reviewer._find_best_matches_batch = fake_batch
+        events = [
+            EventRow(date_text="8.27", performer="Zella Day", venue="MAO"),
+            EventRow(date_text="9.01", performer="PREP", venue="Modern Sky"),
+        ]
+        artists = [
+            PlaylistArtist(name="Zella Day", song_count=1, sample_songs=[]),
+            PlaylistArtist(name="PREP", song_count=1, sample_songs=[]),
+        ]
+
+        suggestions = reviewer.find_best_matches(events, artists)
+
+        self.assertEqual(max_active_count, 2)
+        self.assertEqual(set(suggestions), {0, 1})
+
+    def test_reviewer_reuses_cached_batch_suggestions(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+            event_batch_size=2,
+            event_workers=1,
+        )
+        events = [
+            EventRow(date_text="8.27", performer="Zella Day", venue="MAO"),
+            EventRow(date_text="9.01", performer="PREP", venue="Modern Sky"),
+        ]
+        artists = [
+            PlaylistArtist(name="Zella Day", song_count=1, sample_songs=["Hypnotic"]),
+            PlaylistArtist(name="PREP", song_count=2, sample_songs=["Cheapest Flight"]),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            reviewer = AiArtistReviewer(config, output_root=Path(tmp))
+            calls = []
+
+            def fake_chat(payload):
+                calls.append(payload)
+                return (
+                    '{"matches":['
+                    '{"event_index":0,"artist_name":"Zella Day","confidence":"\u9ad8","reason":"same"},'
+                    '{"event_index":1,"artist_name":"PREP","confidence":"\u9ad8","reason":"same"}'
+                    "]}"
+                )
+
+            reviewer._chat_content = fake_chat
+            first = reviewer.find_best_matches(events, artists)
+
+            reviewer_again = AiArtistReviewer(config, output_root=Path(tmp))
+            reviewer_again._chat_content = lambda payload: (_ for _ in ()).throw(
+                AssertionError("cached suggestions should not call AI again")
+            )
+            second = reviewer_again.find_best_matches(events, artists)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(first, second)
+        self.assertEqual(second[0].artist_name, "Zella Day")
+
+    def test_reviewer_checks_artist_candidate_chunks_beyond_first_limit(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+            candidate_limit=2,
+            event_batch_size=1,
+            event_workers=1,
+        )
+        reviewer = AiArtistReviewer(config)
+        candidate_batches = []
+
+        def fake_chat(payload):
+            content = payload["messages"][-1]["content"]
+            data = json.loads(content.split("JSON:\n", 1)[1])
+            candidates = [item["name"] for item in data["playlist_candidates"]]
+            candidate_batches.append(candidates)
+            if "Late Artist" not in candidates:
+                return '{"matches":[{"event_index":0,"artist_name":null,"confidence":"\u4f4e","reason":"no"}]}'
+            return '{"matches":[{"event_index":0,"artist_name":"Late Artist","confidence":"\u9ad8","reason":"later chunk"}]}'
+
+        reviewer._chat_content = fake_chat
+        events = [EventRow(date_text="8.27", performer="Late Artist", venue="MAO")]
+        artists = [
+            PlaylistArtist(name="Artist 1", song_count=1, sample_songs=[]),
+            PlaylistArtist(name="Artist 2", song_count=1, sample_songs=[]),
+            PlaylistArtist(name="Artist 3", song_count=1, sample_songs=[]),
+            PlaylistArtist(name="Late Artist", song_count=1, sample_songs=[]),
+        ]
+
+        suggestions = reviewer.find_best_matches(events, artists)
+
+        self.assertEqual(
+            candidate_batches,
+            [["Artist 1", "Artist 2"], ["Artist 3", "Late Artist"]],
+        )
+        self.assertEqual(suggestions[0].artist_name, "Late Artist")
+
+    def test_reviewer_splits_artist_candidates_when_single_event_times_out(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+            candidate_limit=4,
+            event_batch_size=1,
+            event_workers=1,
+        )
+        reviewer = AiArtistReviewer(config)
+        candidate_batches = []
+
+        def fake_chat(payload):
+            content = payload["messages"][-1]["content"]
+            data = json.loads(content.split("JSON:\n", 1)[1])
+            candidates = [item["name"] for item in data["playlist_candidates"]]
+            candidate_batches.append(candidates)
+            if len(candidates) == 4:
+                raise TimeoutError("The read operation timed out")
+            if "Late Artist" not in candidates:
+                return '{"matches":[{"event_index":0,"artist_name":null,"confidence":"\u4f4e","reason":"no"}]}'
+            return '{"matches":[{"event_index":0,"artist_name":"Late Artist","confidence":"\u9ad8","reason":"split candidates"}]}'
+
+        reviewer._chat_content = fake_chat
+        events = [EventRow(date_text="8.27", performer="Late Artist", venue="MAO")]
+        artists = [
+            PlaylistArtist(name="Artist 1", song_count=1, sample_songs=[]),
+            PlaylistArtist(name="Artist 2", song_count=1, sample_songs=[]),
+            PlaylistArtist(name="Artist 3", song_count=1, sample_songs=[]),
+            PlaylistArtist(name="Late Artist", song_count=1, sample_songs=[]),
+        ]
+
+        suggestions = reviewer.find_best_matches(events, artists)
+
+        self.assertEqual(
+            candidate_batches,
+            [
+                ["Artist 1", "Artist 2", "Artist 3", "Late Artist"],
+                ["Artist 1", "Artist 2"],
+                ["Artist 3", "Late Artist"],
+            ],
+        )
+        self.assertEqual(suggestions[0].artist_name, "Late Artist")
+
+    def test_reviewer_repairs_malformed_batch_match_json_with_ai(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+            event_batch_size=2,
+        )
+        reviewer = AiArtistReviewer(config)
+        calls = []
+
+        def fake_chat(payload):
+            calls.append(payload)
+            if len(calls) == 1:
+                return "event 0 -> Zella Day, high confidence, same artist"
+            return '{"matches":[{"event_index":0,"artist_name":"Zella Day","confidence":"\u9ad8","reason":"same artist"}]}'
+
+        reviewer._chat_content = fake_chat
+        events = [EventRow(date_text="8.27", performer="ZeIIa Day", venue="MAO")]
+        artists = [PlaylistArtist(name="Zella Day", song_count=1, sample_songs=["Hypnotic"])]
+
+        suggestions = reviewer.find_best_matches(events, artists)
+
+        self.assertEqual(suggestions[0].artist_name, "Zella Day")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("修复", calls[1]["messages"][0]["content"])
+
     def test_reviewer_splits_timed_out_batch_and_retries_smaller_batches(self):
         config = AiMatchConfig(
             enabled=True,
@@ -250,6 +478,7 @@ class AiMatcherTest(unittest.TestCase):
             base_url="https://api.example.com/v1",
             model="text-model",
             event_batch_size=4,
+            event_workers=1,
         )
         reviewer = AiArtistReviewer(config)
         calls = []

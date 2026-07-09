@@ -203,6 +203,59 @@ class MatcherAiReviewTest(unittest.TestCase):
         self.assertEqual(matches[0].venue, "\u6885\u5954")
         self.assertEqual(matches[0].image_name, "detail.jpg")
 
+    def test_ai_only_mode_fills_blank_venue_from_same_artist_overlapping_date_event(self):
+        events = [
+            EventRow(date_text="7.31", performer="\u5f90\u826f", venue="", image_name="summary.jpg"),
+            EventRow(date_text="7.31-8.2", performer="\u5f90\u826f", venue="\u6885\u5954", image_name="detail.jpg"),
+        ]
+        artists = [PlaylistArtist(name="\u5f90\u826f", song_count=4, sample_songs=["\u574f\u5973\u5b69"])]
+        reviewer = FakeBatchReviewer(
+            {
+                0: AiMatchSuggestion(artist_name="\u5f90\u826f", confidence="\u9ad8", reason="\u603b\u89c8\u9875"),
+            }
+        )
+
+        matches = match_events_to_artists(events, artists, ai_reviewer=reviewer, ai_only=True)
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].date_text, "7.31")
+        self.assertEqual(matches[0].venue, "\u6885\u5954")
+        self.assertEqual(matches[0].image_name, "summary.jpg")
+
+    def test_ai_only_mode_does_not_fill_blank_venue_from_different_artist_same_date(self):
+        events = [
+            EventRow(date_text="7.17", performer="Zella Day", venue="", image_name="summary.jpg"),
+            EventRow(date_text="7.17-18", performer="\u5355\u4f9d\u7eaf", venue="\u6885\u5954", image_name="detail.jpg"),
+        ]
+        artists = [PlaylistArtist(name="Zella Day", song_count=1, sample_songs=["Hypnotic"])]
+        reviewer = FakeBatchReviewer(
+            {
+                0: AiMatchSuggestion(artist_name="Zella Day", confidence="\u9ad8", reason="\u603b\u89c8\u9875"),
+            }
+        )
+
+        matches = match_events_to_artists(events, artists, ai_reviewer=reviewer, ai_only=True)
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].venue, "")
+
+    def test_ai_only_mode_fills_blank_venue_from_reverse_alias_event(self):
+        events = [
+            EventRow(date_text="10.24", performer="\u738b\u5609\u5c14", venue="", image_name="summary.jpg"),
+            EventRow(date_text="10.24-25", performer="Jackson Wang", venue="\u6885\u5954", image_name="detail.jpg"),
+        ]
+        artists = [PlaylistArtist(name="\u738b\u5609\u5c14", song_count=7, sample_songs=["LMLY"])]
+        reviewer = FakeBatchReviewer(
+            {
+                0: AiMatchSuggestion(artist_name="\u738b\u5609\u5c14", confidence="\u9ad8", reason="\u603b\u89c8\u9875"),
+            }
+        )
+
+        matches = match_events_to_artists(events, artists, ai_reviewer=reviewer, ai_only=True)
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].venue, "\u6885\u5954")
+
 
 if __name__ == "__main__":
     unittest.main()

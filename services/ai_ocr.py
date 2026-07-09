@@ -42,6 +42,7 @@ class AiOcrConfig:
     max_width: int = 1600
     image_batch_size: int = 8
     image_workers: int = 2
+    local_fallback_enabled: bool = False
     min_agreement_ratio: float = 0.2
     min_events: int = 1
 
@@ -56,6 +57,7 @@ class AiOcrConfig:
             max_width=int(os.environ.get("AI_OCR_MAX_WIDTH", "1600")),
             image_batch_size=max(1, int(os.environ.get("AI_OCR_IMAGE_BATCH_SIZE", "8"))),
             image_workers=max(1, int(os.environ.get("AI_OCR_IMAGE_WORKERS", "2"))),
+            local_fallback_enabled=os.environ.get("AI_OCR_LOCAL_FALLBACK", "").lower() in {"1", "true", "yes", "on"},
             min_agreement_ratio=float(os.environ.get("AI_OCR_MIN_AGREEMENT_RATIO", "0.2")),
             min_events=int(os.environ.get("AI_OCR_MIN_EVENTS", "1")),
         )
@@ -63,7 +65,7 @@ class AiOcrConfig:
     @property
     def cache_source(self) -> str:
         provider_source = "|".join(f"{provider.name}:{provider.model}:{provider.base_url}" for provider in self.providers)
-        return f"ai-ocr:{provider_source}:w{self.max_width}:agree{self.min_agreement_ratio}:min{self.min_events}"
+        return f"ai-ocr:v2-distributed:{provider_source}:w{self.max_width}:batch{self.image_batch_size}:min{self.min_events}"
 
     @property
     def api_key(self) -> str:
@@ -147,6 +149,31 @@ def build_ai_ocr_payload(model: str, image_data_url: str | list[str]) -> dict[st
     }
 
 
+def build_ai_ocr_repair_payload(model: str, raw_text: str) -> dict[str, Any]:
+    system = (
+        "你是 JSON 修复器。只修复格式，不新增、推测或改写图片中没有出现的事实。"
+        "把输入整理成程序可解析的严格 JSON。"
+    )
+    prompt = (
+        "请把下面的 AI OCR 原始输出修复为严格 JSON，格式只能是："
+        '{"events":[{"date_text":"7.11","performer":"歌手名","venue":"场地"}]}\n'
+        "规则：\n"
+        "1. 只能使用原始输出里已经出现的信息。\n"
+        "2. 缺少场地时 venue 用空字符串。\n"
+        "3. 无法确认日期或歌手的行不要输出。\n"
+        "4. 不要返回 Markdown，不要解释，只返回 JSON。\n"
+        f"原始输出：\n{raw_text}"
+    )
+    return {
+        "model": model,
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+    }
+
+
 def _strip_json_fence(raw_text: str) -> str:
     text = str(raw_text or "").strip()
     if text.startswith("```"):
@@ -202,7 +229,12 @@ def _normalize_ai_date(value: str) -> str:
 
 def parse_ai_ocr_events(raw_text: str, image_name: str = "") -> list[EventRow]:
     data = json.loads(_strip_json_fence(raw_text))
-    raw_events = data.get("events", [])
+    if isinstance(data, list):
+        raw_events = data
+    elif isinstance(data, dict):
+        raw_events = data.get("events") or data.get("rows") or data.get("items") or []
+    else:
+        raw_events = []
     if not isinstance(raw_events, list):
         return []
 
@@ -210,13 +242,26 @@ def parse_ai_ocr_events(raw_text: str, image_name: str = "") -> list[EventRow]:
     for item in raw_events:
         if not isinstance(item, dict):
             continue
-        date_text = _normalize_ai_date(str(item.get("date_text", "")))
-        performer = clean_ocr_text(str(item.get("performer", "")))
-        venue = clean_ocr_text(str(item.get("venue", "")))
+        date_text = _normalize_ai_date(
+            _text_field(item, "date_text", "date", "dateText", "演出日期", "日期")
+        )
+        performer = clean_ocr_text(
+            _text_field(item, "performer", "artist", "artist_name", "lineup", "name", "歌手", "阵容")
+        )
+        venue = clean_ocr_text(_text_field(item, "venue", "location", "place", "场地", "演出场所"))
         if not performer or not parse_date_text(date_text):
             continue
         events.append(EventRow(date_text=date_text, performer=performer, venue=venue, image_name=image_name))
     return events
+
+
+def _text_field(item: dict, *names: str) -> str:
+    for name in names:
+        value = item.get(name)
+        if value is None:
+            continue
+        return str(value).strip()
+    return ""
 
 
 def _event_key(event: EventRow) -> tuple[str, str]:
@@ -269,16 +314,6 @@ def select_ai_ocr_events(
     ]
     if not complete_results:
         return []
-    if len(complete_results) == 1:
-        return _merge_event_lists([complete_results[0].events])
-
-    best_agreement = 0.0
-    for left_index, left in enumerate(complete_results):
-        for right in complete_results[left_index + 1 :]:
-            best_agreement = max(best_agreement, _agreement_ratio(left.events, right.events))
-    if best_agreement < min_agreement_ratio:
-        return []
-
     return _merge_event_lists([result.events for result in complete_results])
 
 
@@ -327,18 +362,16 @@ class AiOcrClient:
         worker_count = min(self.image_workers, len(batches))
         if worker_count <= 1:
             for batch in batches:
-                events.extend(self._extract_batch_events(batch))
+                events.extend(self._extract_batch_events_resilient(batch))
             return events
 
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [executor.submit(self._extract_batch_events, batch) for batch in batches]
+            futures = [executor.submit(self._extract_batch_events_resilient, batch) for batch in batches]
             for future in futures:
                 events.extend(future.result())
         return events
 
-    def _extract_batch_events(self, image_paths: list[Path]) -> list[EventRow]:
-        image_data_urls = [_image_path_to_data_url(image_path, self.max_width) for image_path in image_paths]
-        payload = build_ai_ocr_payload(self.provider.model, image_data_urls)
+    def _chat_content(self, payload: dict[str, Any]) -> str:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = request.Request(
             f"{self.provider.base_url}/chat/completions",
@@ -351,45 +384,114 @@ class AiOcrClient:
         )
         with request.urlopen(req, timeout=self.timeout_seconds) as response:
             result = json.loads(response.read().decode("utf-8"))
-        content = result["choices"][0]["message"]["content"]
+        return result["choices"][0]["message"]["content"]
+
+    def _extract_batch_events(self, image_paths: list[Path]) -> list[EventRow]:
+        image_data_urls = [_image_path_to_data_url(image_path, self.max_width) for image_path in image_paths]
+        payload = build_ai_ocr_payload(self.provider.model, image_data_urls)
+        content = self._chat_content(payload)
         batch_name = "+".join(image_path.name for image_path in image_paths)
-        return parse_ai_ocr_events(content, image_name=batch_name)
+        return self._parse_events_with_repair(content, image_name=batch_name)
+
+    def _parse_events_with_repair(self, raw_text: str, image_name: str) -> list[EventRow]:
+        try:
+            events = parse_ai_ocr_events(raw_text, image_name=image_name)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            events = []
+        if events:
+            return events
+
+        repair_payload = build_ai_ocr_repair_payload(self.provider.model, raw_text)
+        repaired_content = self._chat_content(repair_payload)
+        return parse_ai_ocr_events(repaired_content, image_name=image_name)
+
+    def _extract_batch_events_resilient(self, image_paths: list[Path]) -> list[EventRow]:
+        try:
+            events = self._extract_batch_events(image_paths)
+            if events or len(image_paths) <= 1:
+                return events
+            raise ValueError("AI OCR returned no usable rows")
+        except Exception:
+            if len(image_paths) <= 1:
+                raise
+            midpoint = len(image_paths) // 2
+            return self._extract_batch_events_resilient(image_paths[:midpoint]) + self._extract_batch_events_resilient(
+                image_paths[midpoint:]
+            )
 
 
 def _chunked(items: list[Path], size: int) -> list[list[Path]]:
     return [items[index : index + size] for index in range(0, len(items), size)]
 
 
+def _provider_order(providers: tuple[AiOcrProviderConfig, ...], start_index: int) -> list[AiOcrProviderConfig]:
+    if not providers:
+        return []
+    ordered = list(providers)
+    offset = start_index % len(ordered)
+    return ordered[offset:] + ordered[:offset]
+
+
+def _extract_batch_with_provider_fallback(
+    batch: list[Path],
+    providers: tuple[AiOcrProviderConfig, ...],
+    start_index: int,
+    config: AiOcrConfig,
+) -> AiOcrProviderResult:
+    errors: list[str] = []
+    for provider in _provider_order(providers, start_index):
+        client = AiOcrClient(
+            provider,
+            timeout_seconds=config.timeout_seconds,
+            max_width=config.max_width,
+            image_batch_size=config.image_batch_size,
+            image_workers=1,
+        )
+        try:
+            events = client._extract_batch_events_resilient(batch)
+        except Exception as exc:
+            errors.append(f"{provider.name}: {describe_ai_exception(exc)}")
+            continue
+        return AiOcrProviderResult(provider_name=provider.name, events=events)
+    return AiOcrProviderResult(
+        provider_name=",".join(provider.name for provider in providers),
+        events=[],
+        error="; ".join(errors),
+    )
+
+
 def extract_events_with_ai_ocr(image_paths: list[Path], warnings: list[str]) -> list[EventRow]:
     config = AiOcrConfig.from_env()
-    if not config.enabled:
+    if not config.enabled or not image_paths:
         return []
 
-    results: list[AiOcrProviderResult] = []
-    with ThreadPoolExecutor(max_workers=max(1, len(config.providers))) as executor:
+    results_by_batch: dict[int, AiOcrProviderResult] = {}
+    batches = list(_chunked(image_paths, config.image_batch_size))
+    worker_count = min(max(1, config.image_workers * len(config.providers)), len(batches))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = {
             executor.submit(
-                AiOcrClient(
-                    provider,
-                    timeout_seconds=config.timeout_seconds,
-                    max_width=config.max_width,
-                    image_batch_size=config.image_batch_size,
-                    image_workers=config.image_workers,
-                ).extract_events,
-                image_paths,
-            ): provider
-            for provider in config.providers
+                _extract_batch_with_provider_fallback,
+                batch,
+                config.providers,
+                batch_index,
+                config,
+            ): batch_index
+            for batch_index, batch in enumerate(batches)
         }
         for future in as_completed(futures):
-            provider = futures[future]
+            batch_index = futures[future]
             try:
-                events = future.result()
+                result = future.result()
             except Exception as exc:
                 error = describe_ai_exception(exc)
-                results.append(AiOcrProviderResult(provider_name=provider.name, events=[], error=error))
-                warnings.append(f"AI \u8bc6\u522b\u5931\u8d25\uff08{provider.name}\uff09\uff1a{error}")
+                result = AiOcrProviderResult(provider_name="batch", events=[], error=error)
+            if result.error:
+                warnings.append(f"AI \u8bc6\u522b\u5931\u8d25\uff08{result.provider_name}\uff09\uff1a{result.error}")
                 continue
-            results.append(AiOcrProviderResult(provider_name=provider.name, events=events))
+            results_by_batch[batch_index] = result
+
+    results = [results_by_batch[index] for index in sorted(results_by_batch)]
 
     events = select_ai_ocr_events(
         results,
@@ -397,12 +499,12 @@ def extract_events_with_ai_ocr(image_paths: list[Path], warnings: list[str]) -> 
         min_events=config.min_events,
     )
     if not events:
-        warnings.append("AI \u8bc6\u522b\u7ed3\u679c\u7ed3\u6784\u4e0d\u5b8c\u6574\u6216\u4e24\u5bb6\u5dee\u5f02\u8fc7\u5927\uff0c\u5df2\u56de\u9000\u672c\u5730 OCR\u3002")
+        warnings.append("AI \u8bc6\u522b\u672a\u8fd4\u56de\u53ef\u7528\u884c\uff0c\u672a\u81ea\u52a8\u8c03\u7528\u672c\u5730 OCR\u3002")
         return []
 
-    provider_count = len([result for result in results if not result.error])
-    if provider_count >= 2:
-        warnings.append(f"AI \u8bc6\u522b\u5df2\u5e76\u884c\u8c03\u7528 {provider_count} \u5bb6\u6a21\u578b\u5e76\u5408\u5e76\u7ed3\u679c\u3002")
+    provider_names = sorted({result.provider_name for result in results if result.events})
+    if len(provider_names) >= 2:
+        warnings.append(f"AI \u8bc6\u522b\u5df2\u5206\u6279\u5e76\u884c\u8c03\u7528 {len(provider_names)} \u5bb6\u6a21\u578b\u5e76\u5408\u5e76\u7ed3\u679c\u3002")
     else:
         warnings.append("AI \u8bc6\u522b\u5df2\u7528\u4e8e\u56fe\u7247\u8bfb\u53d6\u3002")
     return events

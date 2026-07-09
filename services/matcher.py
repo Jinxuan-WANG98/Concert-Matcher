@@ -3,7 +3,7 @@ from __future__ import annotations
 import difflib
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from services.date_parser import date_ranges_overlap, format_date_for_display, parse_date_range
 from services.models import EventRow, MatchResult, PlaylistArtist
@@ -250,6 +250,7 @@ def match_events_to_artists(
             continue
         deduped.append(match)
 
+    deduped = _fill_blank_match_venues(deduped, events)
     ordered = sorted(deduped, key=lambda item: (_date_sort_key(item.date_text), item.performer, -item.score))
     return [
         MatchResult(
@@ -304,6 +305,69 @@ def _is_duplicate_match(candidate: MatchResult, kept: MatchResult) -> bool:
     if normalize_name(candidate.artist_name) != normalize_name(kept.artist_name):
         return False
     return date_ranges_overlap(candidate.date_text, kept.date_text)
+
+
+def _fill_blank_match_venues(matches: list[MatchResult], events: list[EventRow]) -> list[MatchResult]:
+    venue_events = [event for event in events if event.venue.strip()]
+    if not venue_events:
+        return matches
+
+    enriched: list[MatchResult] = []
+    for match in matches:
+        if match.venue.strip():
+            enriched.append(match)
+            continue
+        venue = _related_event_venue(match, venue_events)
+        enriched.append(replace(match, venue=venue) if venue else match)
+    return enriched
+
+
+def _related_event_venue(match: MatchResult, venue_events: list[EventRow]) -> str:
+    candidates = [
+        event
+        for event in venue_events
+        if date_ranges_overlap(match.date_text, event.date_text) and _event_refers_to_match_artist(event, match)
+    ]
+    if not candidates:
+        return ""
+
+    venue_keys = {normalize_name(event.venue) for event in candidates if event.venue.strip()}
+    if len(venue_keys) != 1:
+        return ""
+    candidates = sorted(candidates, key=lambda event: (-_date_span_days(event.date_text), event.image_name))
+    return candidates[0].venue
+
+
+def _event_refers_to_match_artist(event: EventRow, match: MatchResult) -> bool:
+    return _names_clearly_same(event.performer, match.performer) or _names_clearly_same(
+        event.performer, match.artist_name
+    )
+
+
+def _names_clearly_same(left: str, right: str) -> bool:
+    left_key = normalize_name(left)
+    right_key = normalize_name(right)
+    if not left_key or not right_key:
+        return False
+    if left_key == right_key:
+        return True
+    shorter, longer = (left_key, right_key) if len(left_key) < len(right_key) else (right_key, left_key)
+    if len(shorter) >= 2 and (_has_cjk(left) or _has_cjk(right)) and shorter in longer:
+        return True
+
+    for alias in event_aliases(left):
+        if normalize_name(alias.value) == right_key:
+            return True
+        scored = _score_pair(alias, right)
+        if scored and scored[0] >= 0.87:
+            return True
+    for alias in event_aliases(right):
+        if normalize_name(alias.value) == left_key:
+            return True
+        scored = _score_pair(alias, left)
+        if scored and scored[0] >= 0.87:
+            return True
+    return False
 
 
 def _find_artist_by_name(artists: list[PlaylistArtist], suggested_name: str) -> PlaylistArtist | None:

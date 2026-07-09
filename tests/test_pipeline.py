@@ -62,6 +62,8 @@ class PipelineTest(unittest.TestCase):
             pipeline.parse_ocr_events = lambda images: [EventRow(date_text="8.27", performer="ZeIIa Day", venue="MAO")]
             old_key = os.environ.pop("AI_MATCH_API_KEY", None)
             old_enabled = os.environ.pop("AI_MATCH_ENABLED", None)
+            old_ocr_enabled = os.environ.pop("AI_OCR_ENABLED", None)
+            os.environ["AI_OCR_ENABLED"] = "false"
             try:
                 result = run_match_pipeline(
                     "https://music.163.com/#/playlist?id=1",
@@ -78,6 +80,10 @@ class PipelineTest(unittest.TestCase):
                     os.environ["AI_MATCH_API_KEY"] = old_key
                 if old_enabled is not None:
                     os.environ["AI_MATCH_ENABLED"] = old_enabled
+                if old_ocr_enabled is not None:
+                    os.environ["AI_OCR_ENABLED"] = old_ocr_enabled
+                else:
+                    os.environ.pop("AI_OCR_ENABLED", None)
 
         self.assertEqual(len(result.matches), 1)
         self.assertIn(
@@ -128,7 +134,49 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(result.matches[0].artist_name, "Zella Day")
         self.assertIn("AI \u8bc6\u522b", " ".join(result.warnings))
 
-    def test_pipeline_falls_back_to_local_ocr_when_ai_ocr_fails(self):
+    def test_pipeline_does_not_auto_run_local_ocr_when_ai_ocr_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "note.jpg"
+            image_path.write_bytes(b"fake image content")
+            original_fetch = pipeline.fetch_playlist_artists
+            original_ai_ocr = pipeline.extract_events_with_ai_ocr
+            original_ocr = pipeline.ocr_images_with_rapidocr
+            old_values = {name: os.environ.pop(name, None) for name in [
+                "AI_OCR_ENABLED",
+                "AI_OCR_API_KEY",
+                "AI_OCR_MODEL",
+                "AI_OCR_LOCAL_FALLBACK",
+            ]}
+
+            pipeline.fetch_playlist_artists = lambda url: [PlaylistArtist(name="Zella Day", song_count=1, sample_songs=["Hypnotic"])]
+            pipeline.extract_events_with_ai_ocr = lambda paths, warnings: []
+            pipeline.ocr_images_with_rapidocr = lambda images: (_ for _ in ()).throw(AssertionError("local OCR should not run by default"))
+            os.environ["AI_OCR_ENABLED"] = "true"
+            os.environ["AI_OCR_API_KEY"] = "test-key"
+            os.environ["AI_OCR_MODEL"] = "vision-model"
+
+            try:
+                result = run_match_pipeline(
+                    "https://music.163.com/#/playlist?id=1",
+                    "",
+                    uploaded_images=[image_path],
+                    output_root=Path(tmp) / "out",
+                )
+            finally:
+                pipeline.fetch_playlist_artists = original_fetch
+                pipeline.extract_events_with_ai_ocr = original_ai_ocr
+                pipeline.ocr_images_with_rapidocr = original_ocr
+                for name, value in old_values.items():
+                    if value is not None:
+                        os.environ[name] = value
+                    else:
+                        os.environ.pop(name, None)
+
+        self.assertEqual(result.event_count, 0)
+        self.assertIn("AI \u8bc6\u522b\u672a\u8fd4\u56de\u53ef\u7528\u884c", " ".join(result.warnings))
+        self.assertIn("未自动调用本地 OCR", " ".join(result.warnings))
+
+    def test_pipeline_can_opt_into_local_ocr_fallback_when_ai_ocr_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             image_path = Path(tmp) / "note.jpg"
             image_path.write_bytes(b"fake image content")
@@ -140,6 +188,7 @@ class PipelineTest(unittest.TestCase):
                 "AI_OCR_ENABLED",
                 "AI_OCR_API_KEY",
                 "AI_OCR_MODEL",
+                "AI_OCR_LOCAL_FALLBACK",
             ]}
 
             pipeline.fetch_playlist_artists = lambda url: [PlaylistArtist(name="Zella Day", song_count=1, sample_songs=["Hypnotic"])]
@@ -149,6 +198,7 @@ class PipelineTest(unittest.TestCase):
             os.environ["AI_OCR_ENABLED"] = "true"
             os.environ["AI_OCR_API_KEY"] = "test-key"
             os.environ["AI_OCR_MODEL"] = "vision-model"
+            os.environ["AI_OCR_LOCAL_FALLBACK"] = "true"
 
             try:
                 result = run_match_pipeline(
@@ -169,7 +219,7 @@ class PipelineTest(unittest.TestCase):
                         os.environ.pop(name, None)
 
         self.assertEqual(len(result.matches), 1)
-        self.assertIn("AI \u8bc6\u522b\u672a\u8fd4\u56de\u53ef\u7528\u884c", " ".join(result.warnings))
+        self.assertIn("已按配置回退本地 OCR", " ".join(result.warnings))
 
     def test_pipeline_returns_clear_error_when_playlist_fetch_is_forbidden(self):
         original_fetch = pipeline.fetch_playlist_artists
@@ -189,8 +239,9 @@ class PipelineTest(unittest.TestCase):
 
     def test_pipeline_keeps_local_match_when_ai_review_is_forbidden(self):
         class ForbiddenReviewer:
-            def __init__(self, config):
+            def __init__(self, config, output_root=None):
                 self.config = config
+                self.output_root = output_root
 
             def review(self, event, artist):
                 raise HTTPError(url="https://api.example.com", code=403, msg="Forbidden", hdrs=None, fp=None)
