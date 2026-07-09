@@ -1,6 +1,6 @@
 import unittest
 
-from services.date_parser import format_date_for_display, merge_date_range, parse_date_text
+from services.date_parser import date_ranges_overlap, format_date_for_display, merge_date_range, parse_date_text
 
 
 class DateParserTest(unittest.TestCase):
@@ -24,6 +24,12 @@ class DateParserTest(unittest.TestCase):
 
     def test_parse_date_text_ignores_spaces(self):
         self.assertEqual(parse_date_text("1 2 / 26"), (12, 26))
+
+    def test_date_ranges_overlap_when_single_day_is_inside_range(self):
+        self.assertTrue(date_ranges_overlap("7.31-8.2", "7.31"))
+
+    def test_date_ranges_do_not_overlap_for_different_days(self):
+        self.assertFalse(date_ranges_overlap("7.31-8.2", "8.3"))
 
 
 if __name__ == "__main__":

@@ -1,7 +1,19 @@
+import json
 import os
 import unittest
 
-from services.ai_matcher import AiDecision, AiMatchConfig, build_review_payload, parse_ai_decision
+from services.ai_matcher import (
+    AiDecision,
+    AiMatchConfig,
+    AiMatchSuggestion,
+    build_batch_artist_pick_payload,
+    build_artist_pick_payload,
+    build_review_payload,
+    parse_ai_batch_match_suggestions,
+    parse_ai_decision,
+    parse_ai_match_suggestion,
+    AiArtistReviewer,
+)
 from services.models import EventRow, PlaylistArtist
 
 
@@ -18,6 +30,82 @@ class AiMatcherTest(unittest.TestCase):
                 os.environ["AI_MATCH_ENABLED"] = old_enabled
 
         self.assertFalse(config.enabled)
+
+    def test_config_loads_ai_only_mode(self):
+        old_values = {
+            "AI_MATCH_API_KEY": os.environ.pop("AI_MATCH_API_KEY", None),
+            "AI_MATCH_ENABLED": os.environ.pop("AI_MATCH_ENABLED", None),
+            "AI_MATCH_MODE": os.environ.pop("AI_MATCH_MODE", None),
+        }
+        try:
+            os.environ["AI_MATCH_ENABLED"] = "true"
+            os.environ["AI_MATCH_API_KEY"] = "test-key"
+            os.environ["AI_MATCH_MODE"] = "ai_only"
+
+            config = AiMatchConfig.from_env()
+        finally:
+            for name, value in old_values.items():
+                if value is not None:
+                    os.environ[name] = value
+                else:
+                    os.environ.pop(name, None)
+
+        self.assertTrue(config.enabled)
+        self.assertEqual(config.mode, "ai_only")
+
+    def test_config_loads_event_batch_size(self):
+        old_values = {
+            "AI_MATCH_API_KEY": os.environ.pop("AI_MATCH_API_KEY", None),
+            "AI_MATCH_ENABLED": os.environ.pop("AI_MATCH_ENABLED", None),
+            "AI_MATCH_EVENT_BATCH_SIZE": os.environ.pop("AI_MATCH_EVENT_BATCH_SIZE", None),
+        }
+        try:
+            os.environ["AI_MATCH_ENABLED"] = "true"
+            os.environ["AI_MATCH_API_KEY"] = "test-key"
+            os.environ["AI_MATCH_EVENT_BATCH_SIZE"] = "12"
+
+            config = AiMatchConfig.from_env()
+        finally:
+            for name, value in old_values.items():
+                if value is not None:
+                    os.environ[name] = value
+                else:
+                    os.environ.pop(name, None)
+
+        self.assertEqual(config.event_batch_size, 12)
+
+    def test_config_can_reuse_ocr_provider_key(self):
+        names = [
+            "AI_MATCH_API_KEY",
+            "AI_MATCH_ENABLED",
+            "AI_MATCH_PROVIDER_INDEX",
+            "AI_MATCH_BASE_URL",
+            "AI_MATCH_MODEL",
+            "AI_OCR_PROVIDER_2_API_KEY",
+            "AI_OCR_PROVIDER_2_BASE_URL",
+        ]
+        old_values = {name: os.environ.pop(name, None) for name in names}
+        try:
+            os.environ["AI_MATCH_ENABLED"] = "true"
+            os.environ["AI_MATCH_PROVIDER_INDEX"] = "2"
+            os.environ["AI_MATCH_API_KEY"] = "siliconflow-key"
+            os.environ["AI_MATCH_BASE_URL"] = "https://api.siliconflow.cn/v1"
+            os.environ["AI_MATCH_MODEL"] = "GLM-4-Flash"
+            os.environ["AI_OCR_PROVIDER_2_API_KEY"] = "zhipu-key"
+            os.environ["AI_OCR_PROVIDER_2_BASE_URL"] = "https://open.bigmodel.cn/api/paas/v4"
+
+            config = AiMatchConfig.from_env()
+        finally:
+            for name, value in old_values.items():
+                if value is not None:
+                    os.environ[name] = value
+                else:
+                    os.environ.pop(name, None)
+
+        self.assertTrue(config.enabled)
+        self.assertEqual(config.api_key, "zhipu-key")
+        self.assertEqual(config.base_url, "https://open.bigmodel.cn/api/paas/v4")
+        self.assertEqual(config.model, "GLM-4-Flash")
 
     def test_build_review_payload_contains_only_candidate_context(self):
         event = EventRow(date_text="10.24-25", performer="\u738b\u5609\u5c14", venue="\u6885\u5954")
@@ -45,6 +133,154 @@ class AiMatcherTest(unittest.TestCase):
     def test_parse_ai_decision_rejects_unknown_confidence(self):
         with self.assertRaises(ValueError):
             parse_ai_decision('{"is_match": true, "confidence": "maybe", "reason": "x"}')
+
+    def test_build_artist_pick_payload_contains_playlist_candidates(self):
+        event = EventRow(date_text="8.27", performer="ZeIIa Day", venue="MAO")
+        artists = [
+            PlaylistArtist(name="Zella Day", song_count=1, sample_songs=["Hypnotic"]),
+            PlaylistArtist(name="PREP", song_count=2, sample_songs=["Cheapest Flight"]),
+        ]
+
+        payload = build_artist_pick_payload(event, artists, model="vision-model")
+
+        content = payload["messages"][-1]["content"]
+        self.assertEqual(payload["model"], "vision-model")
+        self.assertIn("ZeIIa Day", content)
+        self.assertIn("Zella Day", content)
+        self.assertIn("artist_name", payload["messages"][0]["content"])
+
+    def test_parse_ai_match_suggestion_accepts_null_artist(self):
+        suggestion = parse_ai_match_suggestion('{"artist_name": null, "confidence": "\u4f4e", "reason": "\u4e0d\u786e\u5b9a"}')
+
+        self.assertIsNone(suggestion)
+
+    def test_parse_ai_match_suggestion_accepts_artist_name(self):
+        suggestion = parse_ai_match_suggestion(
+            '{"artist_name": "Zella Day", "confidence": "\u9ad8", "reason": "OCR \u628a ll \u8bc6\u522b\u6210 II"}'
+        )
+
+        self.assertEqual(
+            suggestion,
+            AiMatchSuggestion(artist_name="Zella Day", confidence="\u9ad8", reason="OCR \u628a ll \u8bc6\u522b\u6210 II"),
+        )
+
+    def test_build_batch_artist_pick_payload_contains_events_and_candidates(self):
+        events = [
+            EventRow(date_text="8.27", performer="ZeIIa Day", venue="MAO"),
+            EventRow(date_text="9.01", performer="PREP", venue="Modern Sky"),
+        ]
+        artists = [
+            PlaylistArtist(name="Zella Day", song_count=1, sample_songs=["Hypnotic"]),
+            PlaylistArtist(name="PREP", song_count=2, sample_songs=["Cheapest Flight"]),
+        ]
+
+        payload = build_batch_artist_pick_payload(events, artists, model="text-model")
+
+        content = payload["messages"][-1]["content"]
+        self.assertEqual(payload["model"], "text-model")
+        self.assertIn("event_index", content)
+        self.assertIn("ZeIIa Day", content)
+        self.assertIn("Zella Day", content)
+        self.assertIn("matches", payload["messages"][0]["content"])
+
+    def test_parse_ai_batch_match_suggestions_accepts_matches(self):
+        suggestions = parse_ai_batch_match_suggestions(
+            """
+            ```json
+            {
+              "matches": [
+                {"event_index": 0, "artist_name": "Zella Day", "confidence": "\u9ad8", "reason": "OCR \u5b57\u5f62\u6df7\u6dc6"},
+                {"event_index": 1, "artist_name": null, "confidence": "\u4f4e", "reason": "\u65e0\u628a\u63e1"}
+              ]
+            }
+            ```
+            """
+        )
+
+        self.assertEqual(
+            suggestions,
+            {0: AiMatchSuggestion(artist_name="Zella Day", confidence="\u9ad8", reason="OCR \u5b57\u5f62\u6df7\u6dc6")},
+        )
+
+    def test_reviewer_batches_event_matching_requests(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+            event_batch_size=2,
+        )
+        reviewer = AiArtistReviewer(config)
+        calls = []
+
+        def fake_chat(payload):
+            calls.append(payload)
+            if len(calls) == 1:
+                return (
+                    '{"matches":['
+                    '{"event_index":0,"artist_name":"Zella Day","confidence":"\u9ad8","reason":"same"},'
+                    '{"event_index":1,"artist_name":"PREP","confidence":"\u9ad8","reason":"same"}'
+                    "]}"
+                )
+            return '{"matches":[{"event_index":2,"artist_name":"Hanser","confidence":"\u4e2d","reason":"alias"}]}'
+
+        reviewer._chat_content = fake_chat
+        events = [
+            EventRow(date_text="8.27", performer="Zella Day", venue="MAO"),
+            EventRow(date_text="9.01", performer="PREP", venue="Modern Sky"),
+            EventRow(date_text="9.02", performer="Hanser", venue="MAO"),
+        ]
+        artists = [
+            PlaylistArtist(name="Zella Day", song_count=1, sample_songs=[]),
+            PlaylistArtist(name="PREP", song_count=1, sample_songs=[]),
+            PlaylistArtist(name="Hanser", song_count=1, sample_songs=[]),
+        ]
+
+        suggestions = reviewer.find_best_matches(events, artists)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(suggestions[0].artist_name, "Zella Day")
+        self.assertEqual(suggestions[1].artist_name, "PREP")
+        self.assertEqual(suggestions[2].artist_name, "Hanser")
+
+    def test_reviewer_splits_timed_out_batch_and_retries_smaller_batches(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+            event_batch_size=4,
+        )
+        reviewer = AiArtistReviewer(config)
+        calls = []
+
+        def fake_chat(payload):
+            content = payload["messages"][-1]["content"]
+            batch = json.loads(content.split("JSON:\n", 1)[1])["events"]
+            indexes = [item["event_index"] for item in batch]
+            calls.append(indexes)
+            if indexes == [0, 1, 2, 3]:
+                raise TimeoutError("The read operation timed out")
+            matches = [
+                {
+                    "event_index": index,
+                    "artist_name": f"Artist {index}",
+                    "confidence": "\u9ad8",
+                    "reason": "\u62c6\u5206\u540e\u6210\u529f",
+                }
+                for index in indexes
+            ]
+            return json.dumps({"matches": matches}, ensure_ascii=False)
+
+        reviewer._chat_content = fake_chat
+        events = [EventRow(date_text=f"8.{index + 1}", performer=f"Artist {index}", venue="MAO") for index in range(4)]
+        artists = [PlaylistArtist(name=f"Artist {index}", song_count=1, sample_songs=[]) for index in range(4)]
+
+        suggestions = reviewer.find_best_matches(events, artists)
+
+        self.assertEqual(calls, [[0, 1, 2, 3], [0, 1], [2, 3]])
+        self.assertEqual(set(suggestions.keys()), {0, 1, 2, 3})
+        self.assertEqual(suggestions[3].artist_name, "Artist 3")
 
 
 if __name__ == "__main__":

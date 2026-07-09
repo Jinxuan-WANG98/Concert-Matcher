@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
-import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from urllib import parse, request
 
 from services.models import PlaylistArtist
@@ -12,6 +13,8 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
     "Referer": "https://music.163.com/",
 }
+
+_NETEASE_MAX_WORKERS = max(1, min(4, int(os.environ.get("NETEASE_MAX_WORKERS", "3"))))
 
 
 def extract_playlist_id(url: str) -> str:
@@ -43,6 +46,12 @@ def _artist_names(song: dict) -> list[str]:
     return [artist.get("name", "").strip() for artist in artists if artist.get("name")]
 
 
+def _fetch_song_chunk(id_chunk: list[str]) -> dict[str, dict]:
+    ids_param = parse.quote(json.dumps([int(item) for item in id_chunk]))
+    detail = _fetch_json(f"https://music.163.com/api/song/detail?ids={ids_param}")
+    return {str(song.get("id")): song for song in detail.get("songs", []) if song.get("id")}
+
+
 def fetch_playlist_artists(playlist_url: str, limit: int = 1000) -> list[PlaylistArtist]:
     playlist_id = extract_playlist_id(playlist_url)
     detail_url = f"https://music.163.com/api/v6/playlist/detail?id={playlist_id}&n={limit}&s=0"
@@ -51,15 +60,20 @@ def fetch_playlist_artists(playlist_url: str, limit: int = 1000) -> list[Playlis
     track_ids = [str(item.get("id")) for item in playlist.get("trackIds", []) if item.get("id")]
     fallback_tracks = {str(song.get("id")): song for song in playlist.get("tracks", []) if song.get("id")}
 
+    chunks = [track_ids[index : index + 80] for index in range(0, len(track_ids), 80)]
+    detail_tracks: dict[str, dict] = {}
+    if len(chunks) <= 1:
+        if chunks:
+            detail_tracks.update(_fetch_song_chunk(chunks[0]))
+    else:
+        workers = min(_NETEASE_MAX_WORKERS, len(chunks))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for chunk_result in executor.map(_fetch_song_chunk, chunks):
+                detail_tracks.update(chunk_result)
+
     songs: list[dict] = []
-    for index in range(0, len(track_ids), 80):
-        id_chunk = track_ids[index : index + 80]
-        ids_param = parse.quote(json.dumps([int(item) for item in id_chunk]))
-        detail = _fetch_json(f"https://music.163.com/api/song/detail?ids={ids_param}")
-        detail_tracks = {str(song.get("id")): song for song in detail.get("songs", []) if song.get("id")}
-        for song_id in id_chunk:
-            songs.append(detail_tracks.get(song_id) or fallback_tracks.get(song_id) or {"id": song_id})
-        time.sleep(0.12)
+    for song_id in track_ids:
+        songs.append(detail_tracks.get(song_id) or fallback_tracks.get(song_id) or {"id": song_id})
 
     artists: OrderedDict[str, PlaylistArtist] = OrderedDict()
     mutable: dict[str, dict] = {}

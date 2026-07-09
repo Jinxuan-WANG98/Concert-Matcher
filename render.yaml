@@ -4,11 +4,55 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --timeout 180 app:app
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --timeout 600 app:app
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.7
       - key: MAX_UPLOAD_MB
         value: "80"
+      - key: OUTPUT_ROOT
+        value: outputs/webapp
       - key: AI_MATCH_ENABLED
+        value: "true"
+      - key: AI_MATCH_BASE_URL
+        value: https://open.bigmodel.cn/api/paas/v4
+      - key: AI_MATCH_MODEL
+        value: GLM-4-Flash
+      - key: AI_MATCH_MODE
+        value: ai_only
+      - key: AI_MATCH_TIMEOUT_SECONDS
+        value: "60"
+      - key: AI_MATCH_CANDIDATE_LIMIT
+        value: "120"
+      - key: AI_MATCH_EVENT_BATCH_SIZE
+        value: "10"
+      - key: AI_OCR_ENABLED
+        value: "true"
+      - key: AI_OCR_PROVIDER_1_NAME
+        value: siliconflow
+      - key: AI_OCR_PROVIDER_1_ENABLED
+        value: "true"
+      - key: AI_OCR_PROVIDER_1_BASE_URL
+        value: https://api.siliconflow.cn/v1
+      - key: AI_OCR_PROVIDER_1_MODEL
+        value: Qwen/Qwen3-VL-8B-Instruct
+      - key: AI_OCR_PROVIDER_2_NAME
+        value: zhipu
+      - key: AI_OCR_PROVIDER_2_ENABLED
         value: "false"
+      - key: AI_OCR_PROVIDER_2_BASE_URL
+        value: https://open.bigmodel.cn/api/paas/v4
+      - key: AI_OCR_PROVIDER_2_MODEL
+        value: GLM-4V-Flash
+      - key: AI_OCR_IMAGE_BATCH_SIZE
+        value: "8"
+      - key: AI_OCR_IMAGE_WORKERS
+        value: "2"
+      - key: AI_OCR_MIN_AGREEMENT_RATIO
+        value: "0.2"
+      - key: AI_OCR_MIN_EVENTS
+        value: "1"
+      - key: AI_OCR_PROVIDER_1_API_KEY
+        sync: false
+      - key: AI_MATCH_API_KEY
+        sync: false

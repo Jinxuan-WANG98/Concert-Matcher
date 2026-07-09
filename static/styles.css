@@ -304,6 +304,12 @@ td {
   vertical-align: top;
 }
 
+th:nth-child(4),
+td:nth-child(4) {
+  white-space: nowrap;
+  min-width: 6.5em;
+}
+
 th {
   background: #ffe4ef;
   color: #7a3654;
@@ -323,6 +329,21 @@ tbody tr:nth-child(even) {
   color: #397850;
   font-weight: 900;
   padding: 4px 10px;
+}
+
+.confidence-high {
+  background: #dff6e7;
+  color: #247a4a;
+}
+
+.confidence-medium {
+  background: #fff4c7;
+  color: #8a6300;
+}
+
+.confidence-low {
+  background: #ffe0e0;
+  color: #a13d3d;
 }
 
 .empty-row {

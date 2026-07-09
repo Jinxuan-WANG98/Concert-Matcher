@@ -5,7 +5,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
-from services.date_parser import format_date_for_display
+from services.date_parser import date_ranges_overlap, format_date_for_display, parse_date_range
 from services.models import EventRow, MatchResult, PlaylistArtist
 
 
@@ -173,9 +173,31 @@ def _score_pair(alias: Alias, artist_name: str) -> tuple[float, str, str] | None
     return None
 
 
-def match_events_to_artists(events: list[EventRow], artists: list[PlaylistArtist], ai_reviewer=None) -> list[MatchResult]:
+def match_events_to_artists(
+    events: list[EventRow],
+    artists: list[PlaylistArtist],
+    ai_reviewer=None,
+    ai_only: bool = False,
+) -> list[MatchResult]:
     raw_matches: list[MatchResult] = []
-    for event in events:
+    batch_suggestions = None
+    if ai_only and ai_reviewer is not None and hasattr(ai_reviewer, "find_best_matches"):
+        batch_suggestions = ai_reviewer.find_best_matches(events, artists)
+
+    for event_index, event in enumerate(events):
+        if ai_only and ai_reviewer is not None and hasattr(ai_reviewer, "find_best_match"):
+            suggestion = (
+                batch_suggestions.get(event_index)
+                if batch_suggestions is not None
+                else ai_reviewer.find_best_match(event, artists)
+            )
+            if suggestion is not None and suggestion.confidence != "\u4f4e":
+                suggested_artist = _find_artist_by_name(artists, suggestion.artist_name)
+                if suggested_artist is not None:
+                    raw_matches.append(_match_from_ai_suggestion(event, suggested_artist, suggestion, "\u76f4\u63a5\u5339\u914d"))
+            continue
+
+        event_match_count = 0
         aliases = event_aliases(event.performer)
         for artist in artists:
             best: tuple[float, str, str, Alias] | None = None
@@ -213,13 +235,22 @@ def match_events_to_artists(events: list[EventRow], artists: list[PlaylistArtist
                     image_name=event.image_name,
                 )
             )
+            event_match_count += 1
 
-    deduped: dict[tuple[str, str, str], MatchResult] = {}
-    for match in sorted(raw_matches, key=lambda item: (-item.score, -item.playlist_song_count)):
-        key = (match.date_text, normalize_name(match.performer), match.artist_name)
-        deduped.setdefault(key, match)
+        if event_match_count == 0 and ai_reviewer is not None and hasattr(ai_reviewer, "find_best_match"):
+            suggestion = ai_reviewer.find_best_match(event, artists)
+            if suggestion is not None and suggestion.confidence != "\u4f4e":
+                suggested_artist = _find_artist_by_name(artists, suggestion.artist_name)
+                if suggested_artist is not None:
+                    raw_matches.append(_match_from_ai_suggestion(event, suggested_artist, suggestion, "\u5019\u9009\u8865\u5145"))
 
-    ordered = sorted(deduped.values(), key=lambda item: (_date_sort_key(item.date_text), item.performer, -item.score))
+    deduped: list[MatchResult] = []
+    for match in sorted(raw_matches, key=_dedupe_sort_key):
+        if any(_is_duplicate_match(match, kept) for kept in deduped):
+            continue
+        deduped.append(match)
+
+    ordered = sorted(deduped, key=lambda item: (_date_sort_key(item.date_text), item.performer, -item.score))
     return [
         MatchResult(
             index=index,
@@ -245,3 +276,59 @@ def _date_sort_key(value: str) -> int:
     if not match:
         return 9999
     return int(match.group(1)) * 100 + int(match.group(2))
+
+
+def _confidence_rank(value: str) -> int:
+    return {"\u9ad8": 3, "\u4e2d": 2, "\u4f4e": 1}.get(value, 0)
+
+
+def _date_span_days(value: str) -> int:
+    date_range = parse_date_range(value)
+    if not date_range:
+        return 1
+    start, end = date_range
+    return max(1, end - start + 1)
+
+
+def _dedupe_sort_key(match: MatchResult) -> tuple[float, int, int, int, int]:
+    return (
+        -match.score,
+        -_confidence_rank(match.confidence),
+        -int(bool(match.venue.strip())),
+        -_date_span_days(match.date_text),
+        -match.playlist_song_count,
+    )
+
+
+def _is_duplicate_match(candidate: MatchResult, kept: MatchResult) -> bool:
+    if normalize_name(candidate.artist_name) != normalize_name(kept.artist_name):
+        return False
+    return date_ranges_overlap(candidate.date_text, kept.date_text)
+
+
+def _find_artist_by_name(artists: list[PlaylistArtist], suggested_name: str) -> PlaylistArtist | None:
+    suggested_key = normalize_name(suggested_name)
+    if not suggested_key:
+        return None
+    for artist in artists:
+        if normalize_name(artist.name) == suggested_key:
+            return artist
+    return None
+
+
+def _match_from_ai_suggestion(event: EventRow, artist: PlaylistArtist, suggestion, label: str) -> MatchResult:
+    return MatchResult(
+        index=0,
+        date_text=event.date_text,
+        date_display=format_date_for_display(event.date_text),
+        performer=clean_name(event.performer),
+        venue=event.venue,
+        artist_name=artist.name,
+        playlist_song_count=artist.song_count,
+        sample_songs=artist.sample_songs[:5],
+        confidence=suggestion.confidence,
+        score=0.84 if suggestion.confidence == "\u9ad8" else 0.76,
+        match_method=f"AI{label}\uff1a{suggestion.reason}",
+        matched_alias=suggestion.artist_name,
+        image_name=event.image_name,
+    )
