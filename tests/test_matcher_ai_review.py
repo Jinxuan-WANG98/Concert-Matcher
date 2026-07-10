@@ -35,7 +35,7 @@ class FakeBatchReviewer:
 
     def find_best_match(self, event, artists):
         self.find_calls += 1
-        raise AssertionError("per-event AI matching should not run when batch matching is available")
+        return None
 
     def find_best_matches(self, events, artists):
         self.batch_calls += 1
@@ -54,7 +54,7 @@ class FakeEmptyBatchReviewer:
 
     def find_best_match(self, event, artists):
         self.find_calls += 1
-        raise AssertionError("per-event fallback should not run after batch matching")
+        return self.suggestion
 
 
 class MatcherAiReviewTest(unittest.TestCase):
@@ -150,7 +150,7 @@ class MatcherAiReviewTest(unittest.TestCase):
         self.assertEqual(reviewer.find_calls, 0)
         self.assertEqual(reviewer.calls, 0)
 
-    def test_ai_only_mode_does_not_fall_back_to_single_match_when_batch_has_no_suggestion(self):
+    def test_ai_only_mode_falls_back_to_single_match_when_batch_has_no_suggestion(self):
         events = [EventRow(date_text="8.27", performer="Zella Day", venue="MAO")]
         artists = [PlaylistArtist(name="Zella Day", song_count=1, sample_songs=["Hypnotic"])]
         reviewer = FakeEmptyBatchReviewer(
@@ -159,9 +159,28 @@ class MatcherAiReviewTest(unittest.TestCase):
 
         matches = match_events_to_artists(events, artists, ai_reviewer=reviewer, ai_only=True)
 
-        self.assertEqual(matches, [])
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].artist_name, "Zella Day")
         self.assertEqual(reviewer.batch_calls, 1)
-        self.assertEqual(reviewer.find_calls, 0)
+        self.assertEqual(reviewer.find_calls, 1)
+
+    def test_ai_only_mode_maps_bilingual_ai_name_to_single_playlist_candidate(self):
+        events = [EventRow(date_text="10.24", performer="Jackson Wang \u738b\u5609\u5c14", venue="")]
+        artists = [PlaylistArtist(name="\u738b\u5609\u5c14", song_count=1, sample_songs=["LMLY"])]
+        reviewer = FakeReviewer(
+            decision=None,
+            suggestion=AiMatchSuggestion(
+                artist_name="Jackson Wang \u738b\u5609\u5c14",
+                confidence="\u9ad8",
+                reason="\u4e2d\u82f1\u6587\u540c\u4e00\u6b4c\u624b",
+            ),
+        )
+
+        matches = match_events_to_artists(events, artists, ai_reviewer=reviewer, ai_only=True)
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].artist_name, "\u738b\u5609\u5c14")
+        self.assertEqual(matches[0].matched_alias, "Jackson Wang \u738b\u5609\u5c14")
 
     def test_ai_only_mode_deduplicates_same_date_artist_and_prefers_venue(self):
         events = [
@@ -193,6 +212,25 @@ class MatcherAiReviewTest(unittest.TestCase):
             {
                 0: AiMatchSuggestion(artist_name="\u5f90\u826f", confidence="\u9ad8", reason="\u8be6\u60c5\u9875"),
                 1: AiMatchSuggestion(artist_name="\u5f90\u826f", confidence="\u9ad8", reason="\u603b\u89c8\u9875"),
+            }
+        )
+
+        matches = match_events_to_artists(events, artists, ai_reviewer=reviewer, ai_only=True)
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].date_text, "7.31-8.2")
+        self.assertEqual(matches[0].venue, "\u6885\u5954")
+
+    def test_ai_only_mode_prefers_complete_date_range_over_higher_confidence_single_day(self):
+        events = [
+            EventRow(date_text="7.31", performer="\u5f90\u826f", venue="", image_name="summary.jpg"),
+            EventRow(date_text="7.31-8.2", performer="\u5f90\u826f", venue="\u6885\u5954", image_name="detail.jpg"),
+        ]
+        artists = [PlaylistArtist(name="\u5f90\u826f", song_count=4, sample_songs=["\u574f\u5973\u5b69"])]
+        reviewer = FakeBatchReviewer(
+            {
+                0: AiMatchSuggestion(artist_name="\u5f90\u826f", confidence="\u9ad8", reason="\u603b\u89c8\u9875"),
+                1: AiMatchSuggestion(artist_name="\u5f90\u826f", confidence="\u4e2d", reason="\u8be6\u60c5\u9875"),
             }
         )
 

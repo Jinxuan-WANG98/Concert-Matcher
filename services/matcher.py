@@ -186,11 +186,9 @@ def match_events_to_artists(
 
     for event_index, event in enumerate(events):
         if ai_only and ai_reviewer is not None and hasattr(ai_reviewer, "find_best_match"):
-            suggestion = (
-                batch_suggestions.get(event_index)
-                if batch_suggestions is not None
-                else ai_reviewer.find_best_match(event, artists)
-            )
+            suggestion = batch_suggestions.get(event_index) if batch_suggestions is not None else None
+            if suggestion is None:
+                suggestion = ai_reviewer.find_best_match(event, artists)
             if suggestion is not None and suggestion.confidence != "\u4f4e":
                 suggested_artist = _find_artist_by_name(artists, suggestion.artist_name)
                 if suggested_artist is not None:
@@ -293,10 +291,10 @@ def _date_span_days(value: str) -> int:
 
 def _dedupe_sort_key(match: MatchResult) -> tuple[float, int, int, int, int]:
     return (
+        -_date_span_days(match.date_text),
         -match.score,
         -_confidence_rank(match.confidence),
         -int(bool(match.venue.strip())),
-        -_date_span_days(match.date_text),
         -match.playlist_song_count,
     )
 
@@ -377,6 +375,9 @@ def _find_artist_by_name(artists: list[PlaylistArtist], suggested_name: str) -> 
     for artist in artists:
         if normalize_name(artist.name) == suggested_key:
             return artist
+    clear_matches = [artist for artist in artists if _names_clearly_same(suggested_name, artist.name)]
+    if len(clear_matches) == 1:
+        return clear_matches[0]
     return None
 
 
