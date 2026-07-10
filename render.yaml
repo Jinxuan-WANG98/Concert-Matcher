@@ -33,7 +33,7 @@ services:
       - key: AI_MATCH_CANDIDATE_LIMIT
         value: "120"
       - key: AI_MATCH_EVENT_BATCH_SIZE
-        value: "10"
+        value: "20"
       - key: AI_MATCH_EVENT_WORKERS
         value: "2"
       - key: AI_OCR_ENABLED

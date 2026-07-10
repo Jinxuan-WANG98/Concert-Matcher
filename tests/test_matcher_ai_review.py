@@ -164,6 +164,22 @@ class MatcherAiReviewTest(unittest.TestCase):
         self.assertEqual(reviewer.batch_calls, 1)
         self.assertEqual(reviewer.find_calls, 1)
 
+    def test_ai_only_mode_skips_per_event_fallback_after_large_batch(self):
+        events = [
+            EventRow(date_text=f"8.{index + 1}", performer=f"Artist {index}", venue="MAO")
+            for index in range(21)
+        ]
+        artists = [PlaylistArtist(name="Zella Day", song_count=1, sample_songs=["Hypnotic"])]
+        reviewer = FakeEmptyBatchReviewer(
+            AiMatchSuggestion(artist_name="Zella Day", confidence="高", reason="should not run")
+        )
+
+        matches = match_events_to_artists(events, artists, ai_reviewer=reviewer, ai_only=True)
+
+        self.assertEqual(matches, [])
+        self.assertEqual(reviewer.batch_calls, 1)
+        self.assertEqual(reviewer.find_calls, 0)
+
     def test_ai_only_mode_maps_bilingual_ai_name_to_single_playlist_candidate(self):
         events = [EventRow(date_text="10.24", performer="Jackson Wang \u738b\u5609\u5c14", venue="")]
         artists = [PlaylistArtist(name="\u738b\u5609\u5c14", song_count=1, sample_songs=["LMLY"])]

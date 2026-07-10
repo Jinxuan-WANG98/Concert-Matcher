@@ -220,6 +220,14 @@ input:focus {
   transform: translateX(24px);
 }
 
+.switch-ui-on {
+  background: linear-gradient(135deg, var(--pink-strong), #80d8ee);
+}
+
+.switch-ui-on::after {
+  transform: translateX(24px);
+}
+
 .switch-card strong {
   display: block;
   margin-bottom: 4px;

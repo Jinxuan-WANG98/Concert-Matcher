@@ -72,7 +72,7 @@ class AiMatchConfig:
 
     @property
     def cache_source(self) -> str:
-        return f"ai-match:v3:{self.base_url}:{self.model}:c{self.candidate_limit}:mode{self.mode}"
+        return f"ai-match:v4:{self.base_url}:{self.model}:c{self.candidate_limit}:mode{self.mode}"
 
 
 def build_review_payload(event: EventRow, artist: PlaylistArtist, model: str = "gpt-4.1-mini") -> dict[str, Any]:
@@ -170,6 +170,11 @@ def build_batch_artist_pick_payload(
         "\u4e0a\u8ff0\u8eab\u4efd\u5bf9\u5e94\u6e05\u6670\u4f46\u5199\u6cd5\u5b58\u5728\u8f7b\u5fae\u6b67\u4e49\u65f6\uff0c\u8fd4\u56de\u4e2d\u7f6e\u4fe1\u5ea6\uff0c\u4e0d\u8981\u76f4\u63a5\u8fd4\u56de null\u3002"
         "\u53ea\u6709\u65e0\u6cd5\u786e\u8ba4\u662f\u540c\u4e00\u827a\u4eba\u65f6\u624d\u8fd4\u56de artist_name: null \u548c confidence: \"\u4f4e\"\u3002"
         "\u4e0d\u8981\u56e0\u4e3a\u98ce\u683c\u76f8\u4f3c\u3001\u540c\u573a\u65e5\u671f\u6216\u5408\u4f5c\u5173\u7cfb\u731c\u6d4b\uff1b\u4e0d\u8981\u8865\u5145 JSON \u4e4b\u5916\u7684\u6587\u5b57\u3002"
+    )
+    system += (
+        "\u53ea\u8fd4\u56de\u786e\u5b9a\u547d\u4e2d\u7684 matches\uff1b"
+        "\u65e0\u6cd5\u786e\u8ba4\u7684\u6f14\u51fa\u4e0d\u8981\u8f93\u51fa\u5bf9\u8c61\uff0c"
+        "\u4e0d\u8981\u8fd4\u56de artist_name: null \u7684\u884c\u3002"
     )
     event_items = [
         {

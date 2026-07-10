@@ -44,6 +44,8 @@ WEAK_TOKENS = {
     "\u4e13\u573a",
 }
 
+AI_ONLY_SINGLE_FALLBACK_EVENT_LIMIT = 20
+
 
 @dataclass(frozen=True)
 class Alias:
@@ -183,11 +185,12 @@ def match_events_to_artists(
     batch_suggestions = None
     if ai_only and ai_reviewer is not None and hasattr(ai_reviewer, "find_best_matches"):
         batch_suggestions = ai_reviewer.find_best_matches(events, artists)
+    allow_single_fallback = batch_suggestions is None or len(events) <= AI_ONLY_SINGLE_FALLBACK_EVENT_LIMIT
 
     for event_index, event in enumerate(events):
         if ai_only and ai_reviewer is not None and hasattr(ai_reviewer, "find_best_match"):
             suggestion = batch_suggestions.get(event_index) if batch_suggestions is not None else None
-            if suggestion is None:
+            if suggestion is None and allow_single_fallback:
                 suggestion = ai_reviewer.find_best_match(event, artists)
             if suggestion is not None and suggestion.confidence != "\u4f4e":
                 suggested_artist = _find_artist_by_name(artists, suggestion.artist_name)

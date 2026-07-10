@@ -25,9 +25,8 @@ class AppRoutesTest(unittest.TestCase):
         self.assertIn("\u8fd1\u671f\u6709\u4f60\u559c\u6b22\u7684\u6b4c\u624b\u5728\u6f14\u51fa", unescaped)
         self.assertIn("\u56fe\u7247\u4e0a\u4f20\uff08\u53ef\u9009\uff09", unescaped)
         self.assertNotIn("\u5c0f\u7ea2\u4e66\u56fe\u7247\u515c\u5e95\u4e0a\u4f20", unescaped)
-        self.assertIn("AI \u590d\u6838", unescaped)
-        self.assertIn('name="use_ai"', body)
-        self.assertIn('name="use_ai" type="checkbox" checked', body)
+        self.assertIn("AI \u667a\u80fd\u5339\u914d", unescaped)
+        self.assertNotIn('name="use_ai"', body)
         self.assertIn('id="result-summary"', body)
 
     def test_match_endpoint_returns_clear_error_for_missing_playlist(self):

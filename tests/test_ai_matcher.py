@@ -64,7 +64,7 @@ class AiMatcherTest(unittest.TestCase):
             model="text-model",
         )
 
-        self.assertTrue(config.cache_source.startswith("ai-match:v3:"))
+        self.assertTrue(config.cache_source.startswith("ai-match:v4:"))
 
     def test_config_loads_event_batch_size(self):
         old_values = {
@@ -230,6 +230,7 @@ class AiMatcherTest(unittest.TestCase):
         self.assertIn("简繁", system)
         self.assertIn("OCR", system)
         self.assertIn("中", system)
+        self.assertIn("只返回确定命中", system)
 
     def test_parse_ai_batch_match_suggestions_accepts_matches(self):
         suggestions = parse_ai_batch_match_suggestions(
