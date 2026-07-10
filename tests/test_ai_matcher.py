@@ -515,6 +515,45 @@ class AiMatcherTest(unittest.TestCase):
         )
         self.assertEqual(suggestions[0].artist_name, "Late Artist")
 
+    def test_reviewer_single_match_checks_artist_candidates_beyond_first_limit(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+            candidate_limit=2,
+            event_batch_size=1,
+            event_workers=1,
+        )
+        reviewer = AiArtistReviewer(config)
+        candidate_batches = []
+
+        def fake_chat(payload):
+            content = payload["messages"][-1]["content"]
+            data = json.loads(content.split("JSON:\n", 1)[1])
+            candidates = [item["name"] for item in data["playlist_candidates"]]
+            candidate_batches.append(candidates)
+            if "Late Artist" not in candidates:
+                return '{"matches":[{"event_index":0,"artist_name":null,"confidence":"低","reason":"no"}]}'
+            return '{"matches":[{"event_index":0,"artist_name":"Late Artist","confidence":"高","reason":"later chunk"}]}'
+
+        reviewer._chat_content = fake_chat
+        event = EventRow(date_text="8.27", performer="Late Artist", venue="MAO")
+        artists = [
+            PlaylistArtist(name="Artist 1", song_count=1, sample_songs=[]),
+            PlaylistArtist(name="Artist 2", song_count=1, sample_songs=[]),
+            PlaylistArtist(name="Artist 3", song_count=1, sample_songs=[]),
+            PlaylistArtist(name="Late Artist", song_count=1, sample_songs=[]),
+        ]
+
+        suggestion = reviewer.find_best_match(event, artists)
+
+        self.assertEqual(
+            candidate_batches,
+            [["Artist 1", "Artist 2"], ["Artist 3", "Late Artist"]],
+        )
+        self.assertEqual(suggestion.artist_name, "Late Artist")
+
     def test_reviewer_splits_artist_candidates_when_single_event_times_out(self):
         config = AiMatchConfig(
             enabled=True,

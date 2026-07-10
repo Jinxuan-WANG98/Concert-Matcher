@@ -502,17 +502,7 @@ class AiArtistReviewer:
         if not self.config.enabled or not artists:
             return None
 
-        payload = build_artist_pick_payload(
-            event,
-            artists,
-            model=self.config.model,
-            candidate_limit=self.config.candidate_limit,
-        )
-        return self._parse_with_ai_repair(
-            self._chat_content(payload),
-            parse_ai_match_suggestion,
-            '{"artist_name": string|null, "confidence": "高|中|低", "reason": string}',
-        )
+        return self._find_best_matches_batch([event], artists, start_index=0).get(0)
 
     def find_best_matches(self, events: list[EventRow], artists: list[PlaylistArtist]) -> dict[int, AiMatchSuggestion]:
         if not self.config.enabled or not events or not artists:
