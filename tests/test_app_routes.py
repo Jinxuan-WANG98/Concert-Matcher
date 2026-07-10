@@ -1,6 +1,8 @@
 import html
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from urllib.error import HTTPError
@@ -28,6 +30,53 @@ class AppRoutesTest(unittest.TestCase):
         self.assertIn("AI \u667a\u80fd\u5339\u914d", unescaped)
         self.assertNotIn('name="use_ai"', body)
         self.assertIn('id="result-summary"', body)
+
+    def test_status_endpoint_reports_idle_by_default(self):
+        client = app.app.test_client()
+
+        response = client.get("/api/status")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json["match_in_progress"])
+
+    def test_match_endpoint_rejects_concurrent_requests(self):
+        client = app.app.test_client()
+        original = app.run_match_pipeline
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_pipeline(*args, **kwargs):
+            started.set()
+            release.wait(timeout=5)
+            return PipelineResult(matches=[], playlist_artist_count=0, event_count=0, warnings=[])
+
+        app.run_match_pipeline = slow_pipeline
+        try:
+            first = threading.Thread(
+                target=lambda: client.post(
+                    "/api/match",
+                    data={
+                        "netease_url": "https://music.163.com/#/playlist?id=1",
+                        "xhs_url": "https://www.xiaohongshu.com/explore/1",
+                    },
+                )
+            )
+            first.start()
+            self.assertTrue(started.wait(timeout=5))
+
+            busy = client.post(
+                "/api/match",
+                data={
+                    "netease_url": "https://music.163.com/#/playlist?id=1",
+                    "xhs_url": "https://www.xiaohongshu.com/explore/1",
+                },
+            )
+            self.assertEqual(busy.status_code, 409)
+            self.assertIn("\u8fdb\u884c\u4e2d", busy.json["error"])
+        finally:
+            release.set()
+            first.join(timeout=5)
+            app.run_match_pipeline = original
 
     def test_match_endpoint_returns_clear_error_for_missing_playlist(self):
         client = app.app.test_client()

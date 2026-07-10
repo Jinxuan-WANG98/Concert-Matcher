@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -42,11 +43,17 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_UPLOAD_MB", "80")) * 1024 * 1024
 
 OUTPUT_ROOT = Path(os.environ.get("OUTPUT_ROOT", "outputs/webapp"))
+_match_lock = threading.Lock()
 
 
 @app.get("/")
 def index():
     return render_template("index.html")
+
+
+@app.get("/api/status")
+def api_status():
+    return jsonify({"match_in_progress": _match_lock.locked()})
 
 
 @app.post("/api/match")
@@ -68,6 +75,17 @@ def api_match():
     if not xhs_url and not uploaded:
         return jsonify({"error": "\u8bf7\u586b\u5199\u5c0f\u7ea2\u4e66\u94fe\u63a5\uff0c\u6216\u4e0a\u4f20\u5c0f\u7ea2\u4e66\u56fe\u7247"}), 400
 
+    if not _match_lock.acquire(blocking=False):
+        # #region agent log
+        debug_log(
+            "app.py:api_match",
+            "match request rejected busy",
+            {},
+            hypothesis_id="H8",
+        )
+        # #endregion
+        return jsonify({"error": "\u5df2\u6709\u5339\u914d\u4efb\u52a1\u5728\u8fdb\u884c\u4e2d\uff0c\u8bf7\u7b49\u5f85\u5b8c\u6210\u540e\u518d\u8bd5"}), 409
+
     # #region agent log
     request_started = time.perf_counter()
     debug_log(
@@ -83,65 +101,68 @@ def api_match():
     # #endregion
 
     try:
-        result = run_match_pipeline(
-            netease_url,
-            xhs_url,
-            uploaded_images=uploaded,
-            output_root=OUTPUT_ROOT,
-            use_ai=use_ai,
-        )
-    except HTTPError as exc:
-        if exc.code == 403:
-            return jsonify({"error": FORBIDDEN_EXTERNAL_MESSAGE}), 502
-        return jsonify({"error": f"外部服务请求失败：HTTP {exc.code}"}), 502
-    except Exception as exc:
+        try:
+            result = run_match_pipeline(
+                netease_url,
+                xhs_url,
+                uploaded_images=uploaded,
+                output_root=OUTPUT_ROOT,
+                use_ai=use_ai,
+            )
+        except HTTPError as exc:
+            if exc.code == 403:
+                return jsonify({"error": FORBIDDEN_EXTERNAL_MESSAGE}), 502
+            return jsonify({"error": f"外部服务请求失败：HTTP {exc.code}"}), 502
+        except Exception as exc:
+            # #region agent log
+            debug_log(
+                "app.py:api_match",
+                "match request failed",
+                {"error": str(exc)},
+                hypothesis_id="H5",
+            )
+            # #endregion
+            return jsonify({"error": str(exc)}), 500
+
         # #region agent log
         debug_log(
             "app.py:api_match",
-            "match request failed",
-            {"error": str(exc)},
+            "match request completed",
+            {
+                "elapsedMs": int((time.perf_counter() - request_started) * 1000),
+                "eventCount": result.event_count,
+                "matchCount": len(result.matches),
+                "warningCount": len(result.warnings),
+            },
             hypothesis_id="H5",
         )
         # #endregion
-        return jsonify({"error": str(exc)}), 500
 
-    # #region agent log
-    debug_log(
-        "app.py:api_match",
-        "match request completed",
-        {
-            "elapsedMs": int((time.perf_counter() - request_started) * 1000),
-            "eventCount": result.event_count,
-            "matchCount": len(result.matches),
-            "warningCount": len(result.warnings),
-        },
-        hypothesis_id="H5",
-    )
-    # #endregion
-
-    download_url = f"/download/{result.excel_path.parent.name}" if result.excel_path else ""
-    return jsonify(
-        {
-            "matches": [
-                {
-                    "index": match.index,
-                    "date": match.date_display,
-                    "artist": match.artist_name,
-                    "venue": match.venue,
-                    "playlist_song_count": match.playlist_song_count,
-                    "sample_songs": match.sample_songs,
-                    "confidence": match.confidence,
-                }
-                for match in result.matches
-            ],
-            "playlist_artist_count": result.playlist_artist_count,
-            "event_count": result.event_count,
-            "warnings": result.warnings,
-            "download_url": download_url,
-            "phase_timings": result.phase_timings,
-            "total_elapsed_ms": int((time.perf_counter() - request_started) * 1000),
-        }
-    )
+        download_url = f"/download/{result.excel_path.parent.name}" if result.excel_path else ""
+        return jsonify(
+            {
+                "matches": [
+                    {
+                        "index": match.index,
+                        "date": match.date_display,
+                        "artist": match.artist_name,
+                        "venue": match.venue,
+                        "playlist_song_count": match.playlist_song_count,
+                        "sample_songs": match.sample_songs,
+                        "confidence": match.confidence,
+                    }
+                    for match in result.matches
+                ],
+                "playlist_artist_count": result.playlist_artist_count,
+                "event_count": result.event_count,
+                "warnings": result.warnings,
+                "download_url": download_url,
+                "phase_timings": result.phase_timings,
+                "total_elapsed_ms": int((time.perf_counter() - request_started) * 1000),
+            }
+        )
+    finally:
+        _match_lock.release()
 
 
 @app.get("/download/<job_id>")

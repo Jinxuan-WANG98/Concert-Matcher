@@ -23,4 +23,5 @@ class RenderConfigTest(unittest.TestCase):
         self.assertIn("glm-4.6v", text)
         self.assertIn("key: AI_OCR_MAX_WIDTH", text)
         self.assertIn('value: "4096"', text)
-        self.assertNotIn("--threads 2", text)
+        self.assertIn("--worker-class gthread", text)
+        self.assertIn("--threads 2", text)
