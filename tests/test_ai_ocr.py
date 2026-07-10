@@ -32,6 +32,7 @@ class AiOcrTest(unittest.TestCase):
             "AI_OCR_MAX_WIDTH",
             "AI_OCR_IMAGE_BATCH_SIZE",
             "AI_OCR_IMAGE_WORKERS",
+            "AI_OCR_MAX_TOKENS",
             "AI_OCR_LOCAL_FALLBACK",
             "AI_OCR_MIN_AGREEMENT_RATIO",
             "AI_OCR_MIN_EVENTS",
@@ -190,9 +191,11 @@ class AiOcrTest(unittest.TestCase):
 
         message = payload["messages"][1]
         self.assertEqual(payload["model"], "Qwen/Qwen2.5-VL-72B-Instruct")
+        self.assertEqual(payload["max_tokens"], 8192)
         self.assertEqual(message["content"][0]["type"], "image_url")
         self.assertEqual(message["content"][0]["image_url"]["detail"], "high")
         self.assertIn("JSON", message["content"][1]["text"])
+        self.assertIn("穷尽", message["content"][1]["text"])
 
     def test_select_ai_ocr_events_merges_agreeing_provider_results(self):
         siliconflow = AiOcrProviderResult(

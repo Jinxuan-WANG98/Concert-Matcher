@@ -13,3 +13,8 @@ class RenderConfigTest(unittest.TestCase):
         self.assertIn("key: AI_OCR_IMAGE_WORKERS", text)
         self.assertIn("key: AI_MATCH_EVENT_WORKERS", text)
         self.assertIn("key: AI_OCR_LOCAL_FALLBACK", text)
+        self.assertIn("key: AI_OCR_MAX_TOKENS", text)
+        self.assertIn('key: AI_OCR_PROVIDER_2_ENABLED', text)
+        self.assertIn('value: "true"', text)
+        self.assertIn("Qwen/Qwen2.5-VL-72B-Instruct", text)
+        self.assertIn("GLM-4V-Flash", text)
