@@ -16,6 +16,7 @@ from PIL import Image
 
 from services.ai_errors import describe_ai_exception
 from services.date_parser import merge_date_range, parse_date_text
+from services.debug_timing import PhaseTimer, debug_log
 from services.models import EventRow
 from services.ocr import clean_ocr_text
 
@@ -47,6 +48,7 @@ class AiOcrConfig:
     local_fallback_enabled: bool = False
     min_agreement_ratio: float = 0.2
     min_events: int = 1
+    image_detail: str = "auto"
 
     @classmethod
     def from_env(cls) -> "AiOcrConfig":
@@ -63,6 +65,7 @@ class AiOcrConfig:
             local_fallback_enabled=os.environ.get("AI_OCR_LOCAL_FALLBACK", "").lower() in {"1", "true", "yes", "on"},
             min_agreement_ratio=float(os.environ.get("AI_OCR_MIN_AGREEMENT_RATIO", "0.2")),
             min_events=int(os.environ.get("AI_OCR_MIN_EVENTS", "1")),
+            image_detail=_ocr_image_detail(),
         )
 
     @property
@@ -133,28 +136,16 @@ def _providers_from_env() -> list[AiOcrProviderConfig]:
     return providers
 
 
-def _debug_log(location: str, message: str, data: dict[str, Any], hypothesis_id: str = "") -> None:
-    # #region agent log
-    try:
-        payload = {
-            "sessionId": "c69de8",
-            "timestamp": int(time.time() * 1000),
-            "location": location,
-            "message": message,
-            "data": data,
-            "hypothesisId": hypothesis_id,
-        }
-        with Path("debug-c69de8.log").open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except OSError:
-        pass
-    # #endregion
+def _ocr_image_detail() -> str:
+    detail = os.environ.get("AI_OCR_IMAGE_DETAIL", "auto").strip().lower()
+    return detail if detail in {"high", "low", "auto"} else "auto"
 
 
 def build_ai_ocr_payload(
     model: str,
     image_data_url: str | list[str],
     max_tokens: int = 8192,
+    image_detail: str | None = None,
 ) -> dict[str, Any]:
     image_data_urls = [image_data_url] if isinstance(image_data_url, str) else list(image_data_url)
     system = (
@@ -174,8 +165,9 @@ def build_ai_ocr_payload(
         "5. \u5fc5\u987b\u7a77\u5c3d\u63d0\u53d6\u6bcf\u4e00\u884c\u6f14\u51fa\uff0c\u5305\u62ec\u591a\u680f\u6458\u8981\u9875\u91cc\u6240\u6709\u65e5\u671f\u680f\u4e0b\u7684\u6bcf\u4f4d\u6b4c\u624b\uff0c\u4e0d\u8981\u63d0\u524d\u505c\u6b62\u3002\n"
         "6. \u4e0d\u8981\u8fd4\u56de JSON \u4e4b\u5916\u7684\u6587\u5b57\u3002"
     )
+    detail = image_detail or _ocr_image_detail()
     content: list[dict[str, Any]] = [
-        {"type": "image_url", "image_url": {"url": image_url, "detail": "high"}}
+        {"type": "image_url", "image_url": {"url": image_url, "detail": detail}}
         for image_url in image_data_urls
     ]
     content.append({"type": "text", "text": prompt})
@@ -379,6 +371,7 @@ class AiOcrClient:
         image_batch_size: int | None = None,
         image_workers: int | None = None,
         max_tokens: int | None = None,
+        image_detail: str | None = None,
     ):
         if isinstance(provider, AiOcrConfig):
             config = provider
@@ -388,12 +381,14 @@ class AiOcrClient:
             image_batch_size = config.image_batch_size
             image_workers = config.image_workers
             max_tokens = config.max_tokens
+            image_detail = config.image_detail
         self.provider = provider
         self.timeout_seconds = timeout_seconds or 45
         self.max_width = max_width or 1600
         self.image_batch_size = max(1, image_batch_size or 8)
         self.image_workers = max(1, image_workers or 2)
         self.max_tokens = max(512, max_tokens or 8192)
+        self.image_detail = image_detail or _ocr_image_detail()
 
     def extract_events(self, image_paths: list[Path]) -> list[EventRow]:
         if self.provider is None:
@@ -416,7 +411,8 @@ class AiOcrClient:
                 events.extend(future.result())
         return events
 
-    def _chat_content(self, payload: dict[str, Any]) -> str:
+    def _chat_content(self, payload: dict[str, Any], call_kind: str = "ocr") -> str:
+        started = time.perf_counter()
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = request.Request(
             f"{self.provider.base_url}/chat/completions",
@@ -429,16 +425,33 @@ class AiOcrClient:
         )
         with request.urlopen(req, timeout=self.timeout_seconds) as response:
             result = json.loads(response.read().decode("utf-8"))
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        debug_log(
+            "ai_ocr.py:_chat_content",
+            "ai ocr api call complete",
+            {
+                "callKind": call_kind,
+                "provider": self.provider.name if self.provider else "",
+                "model": self.provider.model if self.provider else "",
+                "elapsedMs": elapsed_ms,
+            },
+            hypothesis_id="H1",
+        )
         return result["choices"][0]["message"]["content"]
 
     def _extract_batch_events(self, image_paths: list[Path]) -> list[EventRow]:
         image_data_urls = [_image_path_to_data_url(image_path, self.max_width) for image_path in image_paths]
-        payload = build_ai_ocr_payload(self.provider.model, image_data_urls, max_tokens=self.max_tokens)
-        content = self._chat_content(payload)
+        payload = build_ai_ocr_payload(
+            self.provider.model,
+            image_data_urls,
+            max_tokens=self.max_tokens,
+            image_detail=self.image_detail,
+        )
+        content = self._chat_content(payload, call_kind="ocr")
         batch_name = "+".join(image_path.name for image_path in image_paths)
         events = self._parse_events_with_repair(content, image_name=batch_name)
         # #region agent log
-        _debug_log(
+        debug_log(
             "ai_ocr.py:_extract_batch_events",
             "ai ocr batch parsed",
             {
@@ -447,11 +460,18 @@ class AiOcrClient:
                 "eventCount": len(events),
                 "rawLength": len(content or ""),
                 "maxTokens": self.max_tokens,
+                "imageDetail": self.image_detail,
             },
             hypothesis_id="H1",
         )
         # #endregion
         return events
+
+    def _should_attempt_repair(self, raw_text: str) -> bool:
+        text = str(raw_text or "").strip()
+        if len(text) < 8:
+            return False
+        return "{" in text or "events" in text.lower()
 
     def _parse_events_with_repair(self, raw_text: str, image_name: str) -> list[EventRow]:
         try:
@@ -460,9 +480,17 @@ class AiOcrClient:
             events = []
         if events:
             return events
+        if not self._should_attempt_repair(raw_text):
+            debug_log(
+                "ai_ocr.py:_parse_events_with_repair",
+                "skipped ai ocr repair call",
+                {"imageName": image_name, "rawLength": len(str(raw_text or ""))},
+                hypothesis_id="H3",
+            )
+            return []
 
         repair_payload = build_ai_ocr_repair_payload(self.provider.model, raw_text, max_tokens=self.max_tokens)
-        repaired_content = self._chat_content(repair_payload)
+        repaired_content = self._chat_content(repair_payload, call_kind="repair")
         return parse_ai_ocr_events(repaired_content, image_name=image_name)
 
     def _extract_batch_events_resilient(self, image_paths: list[Path]) -> list[EventRow]:
@@ -475,6 +503,12 @@ class AiOcrClient:
             if len(image_paths) <= 1:
                 raise
             midpoint = len(image_paths) // 2
+            debug_log(
+                "ai_ocr.py:_extract_batch_events_resilient",
+                "splitting ocr batch after empty result",
+                {"imageCount": len(image_paths), "leftCount": midpoint, "rightCount": len(image_paths) - midpoint},
+                hypothesis_id="H3",
+            )
             return self._extract_batch_events_resilient(image_paths[:midpoint]) + self._extract_batch_events_resilient(
                 image_paths[midpoint:]
             )
@@ -507,6 +541,7 @@ def _extract_batch_with_provider_fallback(
             image_batch_size=config.image_batch_size,
             image_workers=1,
             max_tokens=config.max_tokens,
+            image_detail=config.image_detail,
         )
         try:
             events = client._extract_batch_events_resilient(batch)
@@ -526,95 +561,95 @@ def extract_events_with_ai_ocr(image_paths: list[Path], warnings: list[str]) -> 
     if not config.enabled or not image_paths:
         return []
 
-    # #region agent log
-    _debug_log(
-        "ai_ocr.py:extract_events_with_ai_ocr",
-        "ai ocr providers loaded",
-        {
-            "providerNames": [provider.name for provider in config.providers],
-            "providerModels": [provider.model for provider in config.providers],
-            "providerCount": len(config.providers),
-        },
-        hypothesis_id="H4",
-    )
-    # #endregion
-
-    results_by_batch: dict[int, AiOcrProviderResult] = {}
-    batches = list(_chunked(image_paths, config.image_batch_size))
-    worker_count = min(max(1, config.image_workers * len(config.providers)), len(batches))
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = {
-            executor.submit(
-                _extract_batch_with_provider_fallback,
-                batch,
-                config.providers,
-                batch_index,
-                config,
-            ): batch_index
-            for batch_index, batch in enumerate(batches)
-        }
-        for future in as_completed(futures):
-            batch_index = futures[future]
-            try:
-                result = future.result()
-            except Exception as exc:
-                error = describe_ai_exception(exc)
-                result = AiOcrProviderResult(provider_name="batch", events=[], error=error)
-            if result.error:
-                warnings.append(f"AI \u8bc6\u522b\u5931\u8d25\uff08{result.provider_name}\uff09\uff1a{result.error}")
-                # #region agent log
-                _debug_log(
-                    "ai_ocr.py:extract_events_with_ai_ocr",
-                    "ai ocr batch failed",
-                    {"batchIndex": batch_index, "provider": result.provider_name, "error": result.error},
-                    hypothesis_id="H3",
-                )
-                # #endregion
-                continue
-            results_by_batch[batch_index] = result
-            # #region agent log
-            _debug_log(
-                "ai_ocr.py:extract_events_with_ai_ocr",
-                "ai ocr batch succeeded",
-                {
-                    "batchIndex": batch_index,
-                    "provider": result.provider_name,
-                    "eventCount": len(result.events),
-                },
-                hypothesis_id="H1",
-            )
-            # #endregion
-
-    results = [results_by_batch[index] for index in sorted(results_by_batch)]
-
-    events = select_ai_ocr_events(
-        results,
-        min_agreement_ratio=config.min_agreement_ratio,
-        min_events=config.min_events,
-    )
-    if not events:
-        warnings.append("AI \u8bc6\u522b\u672a\u8fd4\u56de\u53ef\u7528\u884c\uff0c\u672a\u81ea\u52a8\u8c03\u7528\u672c\u5730 OCR\u3002")
-        return []
-
-    provider_names = sorted({result.provider_name for result in results if result.events})
-    if len(provider_names) >= 2:
-        warnings.append(f"AI \u8bc6\u522b\u5df2\u5206\u6279\u5e76\u884c\u8c03\u7528 {len(provider_names)} \u5bb6\u6a21\u578b\u5e76\u5408\u5e76\u7ed3\u679c\u3002")
-    else:
-        warnings.append("AI \u8bc6\u522b\u5df2\u7528\u4e8e\u56fe\u7247\u8bfb\u53d6\u3002")
-    # #region agent log
-    _debug_log(
-        "ai_ocr.py:extract_events_with_ai_ocr",
-        "ai ocr extraction complete",
-        {
+    with PhaseTimer("ai_ocr.py:extract_events_with_ai_ocr", "ai_ocr_total") as timer:
+        timer.data = {
             "imageCount": len(image_paths),
-            "batchCount": len(batches),
-            "successfulBatches": len(results),
-            "mergedEventCount": len(events),
             "batchSize": config.image_batch_size,
-            "maxTokens": config.max_tokens,
-            "model": config.model,
-        },
-        hypothesis_id="H2",
-    )
-    # #endregion
-    return events
+            "imageWorkers": config.image_workers,
+            "imageDetail": config.image_detail,
+        }
+        debug_log(
+            "ai_ocr.py:extract_events_with_ai_ocr",
+            "ai ocr providers loaded",
+            {
+                "providerNames": [provider.name for provider in config.providers],
+                "providerModels": [provider.model for provider in config.providers],
+                "providerCount": len(config.providers),
+            },
+            hypothesis_id="H4",
+        )
+
+        results_by_batch: dict[int, AiOcrProviderResult] = {}
+        batches = list(_chunked(image_paths, config.image_batch_size))
+        worker_count = min(max(1, config.image_workers), len(batches))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(
+                    _extract_batch_with_provider_fallback,
+                    batch,
+                    config.providers,
+                    batch_index,
+                    config,
+                ): batch_index
+                for batch_index, batch in enumerate(batches)
+            }
+            for future in as_completed(futures):
+                batch_index = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    error = describe_ai_exception(exc)
+                    result = AiOcrProviderResult(provider_name="batch", events=[], error=error)
+                if result.error:
+                    warnings.append(f"AI \u8bc6\u522b\u5931\u8d25\uff08{result.provider_name}\uff09\uff1a{result.error}")
+                    debug_log(
+                        "ai_ocr.py:extract_events_with_ai_ocr",
+                        "ai ocr batch failed",
+                        {"batchIndex": batch_index, "provider": result.provider_name, "error": result.error},
+                        hypothesis_id="H3",
+                    )
+                    continue
+                results_by_batch[batch_index] = result
+                debug_log(
+                    "ai_ocr.py:extract_events_with_ai_ocr",
+                    "ai ocr batch succeeded",
+                    {
+                        "batchIndex": batch_index,
+                        "provider": result.provider_name,
+                        "eventCount": len(result.events),
+                    },
+                    hypothesis_id="H1",
+                )
+
+        results = [results_by_batch[index] for index in sorted(results_by_batch)]
+        events = select_ai_ocr_events(
+            results,
+            min_agreement_ratio=config.min_agreement_ratio,
+            min_events=config.min_events,
+        )
+        timer.data["mergedEventCount"] = len(events)
+        timer.data["successfulBatches"] = len(results)
+        if not events:
+            warnings.append("AI \u8bc6\u522b\u672a\u8fd4\u56de\u53ef\u7528\u884c\uff0c\u672a\u81ea\u52a8\u8c03\u7528\u672c\u5730 OCR\u3002")
+            return []
+
+        provider_names = sorted({result.provider_name for result in results if result.events})
+        if len(provider_names) >= 2:
+            warnings.append(f"AI \u8bc6\u522b\u5df2\u5206\u6279\u5e76\u884c\u8c03\u7528 {len(provider_names)} \u5bb6\u6a21\u578b\u5e76\u5408\u5e76\u7ed3\u679c\u3002")
+        else:
+            warnings.append("AI \u8bc6\u522b\u5df2\u7528\u4e8e\u56fe\u7247\u8bfb\u53d6\u3002")
+        debug_log(
+            "ai_ocr.py:extract_events_with_ai_ocr",
+            "ai ocr extraction complete",
+            {
+                "imageCount": len(image_paths),
+                "batchCount": len(batches),
+                "successfulBatches": len(results),
+                "mergedEventCount": len(events),
+                "batchSize": config.image_batch_size,
+                "maxTokens": config.max_tokens,
+                "model": config.model,
+            },
+            hypothesis_id="H2",
+        )
+        return events

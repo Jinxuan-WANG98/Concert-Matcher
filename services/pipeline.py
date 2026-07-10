@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -10,6 +12,7 @@ from PIL import Image
 from services.ai_errors import describe_ai_exception
 from services.ai_ocr import AiOcrConfig, extract_events_with_ai_ocr
 from services.ai_matcher import AiArtistReviewer, AiMatchConfig
+from services.debug_timing import PhaseTimer, debug_log, get_phase_timings, reset_phase_timings
 from services.export_excel import write_matches_xlsx
 from services.matcher import match_events_to_artists
 from services.models import EventRow, PipelineResult, PlaylistArtist
@@ -226,6 +229,83 @@ def _load_events_for_xhs(
     return events
 
 
+def _parallel_pipeline_enabled() -> bool:
+    return os.environ.get("PIPELINE_PARALLEL_LOAD", "true").lower() in {"1", "true", "yes", "on"}
+
+
+def _load_events_and_artists(
+    netease_url: str,
+    *,
+    xhs_url: str,
+    image_paths: list[Path],
+    job_dir: Path,
+    output_root: Path,
+    warnings: list[str],
+) -> tuple[list[PlaylistArtist], list[EventRow]]:
+    parallel_pipeline = _parallel_pipeline_enabled()
+
+    def load_artists() -> list[PlaylistArtist]:
+        with PhaseTimer("pipeline.py", "load_playlist_artists") as timer:
+            artists = _load_playlist_artists(netease_url)
+            timer.data["artistCount"] = len(artists)
+            return artists
+
+    if image_paths:
+        if parallel_pipeline:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                artists_future = executor.submit(load_artists)
+                events_future = executor.submit(
+                    _load_events_for_uploaded_images,
+                    image_paths,
+                    output_root,
+                    warnings,
+                )
+                artists = artists_future.result()
+                with PhaseTimer("pipeline.py", "load_uploaded_events") as timer:
+                    events = events_future.result()
+                    timer.data["eventCount"] = len(events)
+                    timer.data["imageCount"] = len(image_paths)
+        else:
+            artists = load_artists()
+            with PhaseTimer("pipeline.py", "load_uploaded_events") as timer:
+                events = _load_events_for_uploaded_images(image_paths, output_root, warnings)
+                timer.data["eventCount"] = len(events)
+                timer.data["imageCount"] = len(image_paths)
+        return artists, events
+
+    if xhs_url.strip():
+        if parallel_pipeline:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                artists_future = executor.submit(load_artists)
+                events_future = executor.submit(_load_events_for_xhs, xhs_url, job_dir, output_root, warnings)
+                try:
+                    with PhaseTimer("pipeline.py", "load_xhs_events") as timer:
+                        events = events_future.result()
+                        timer.data["eventCount"] = len(events)
+                except Exception as exc:
+                    warnings.append(
+                        "\u5c0f\u7ea2\u4e66\u94fe\u63a5\u6293\u53d6\u5931\u8d25\uff1a"
+                        f"{exc}\u3002\u8bf7\u4e0a\u4f20\u56fe\u7247\u7ee7\u7eed\u8bc6\u522b\u3002"
+                    )
+                    events = []
+                artists = artists_future.result()
+        else:
+            try:
+                with PhaseTimer("pipeline.py", "load_xhs_events") as timer:
+                    events = _load_events_for_xhs(xhs_url, job_dir, output_root, warnings)
+                    timer.data["eventCount"] = len(events)
+            except Exception as exc:
+                warnings.append(
+                    "\u5c0f\u7ea2\u4e66\u94fe\u63a5\u6293\u53d6\u5931\u8d25\uff1a"
+                    f"{exc}\u3002\u8bf7\u4e0a\u4f20\u56fe\u7247\u7ee7\u7eed\u8bc6\u522b\u3002"
+                )
+                events = []
+            artists = load_artists()
+        return artists, events
+
+    return load_artists(), []
+
+
 def run_match_pipeline(
     netease_url: str,
     xhs_url: str,
@@ -237,32 +317,18 @@ def run_match_pipeline(
     output_root = output_root or Path("outputs/webapp")
     job_dir = output_root / uuid.uuid4().hex
     job_dir.mkdir(parents=True, exist_ok=True)
+    pipeline_started = time.perf_counter()
+    reset_phase_timings()
 
     image_paths = list(uploaded_images or [])
-    events: list[EventRow] | None = None
-    artists: list[PlaylistArtist]
-
-    if not image_paths and xhs_url.strip():
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            artists_future = executor.submit(_load_playlist_artists, netease_url)
-            events_future = executor.submit(_load_events_for_xhs, xhs_url, job_dir, output_root, warnings)
-            try:
-                events = events_future.result()
-            except Exception as exc:
-                warnings.append(
-                    "\u5c0f\u7ea2\u4e66\u94fe\u63a5\u6293\u53d6\u5931\u8d25\uff1a"
-                    f"{exc}\u3002\u8bf7\u4e0a\u4f20\u56fe\u7247\u7ee7\u7eed\u8bc6\u522b\u3002"
-                )
-                events = []
-            artists = artists_future.result()
-    else:
-        artists = _load_playlist_artists(netease_url)
-
-    if image_paths:
-        events = _load_events_for_uploaded_images(image_paths, output_root, warnings)
-
-    if events is None:
-        events = []
+    artists, events = _load_events_and_artists(
+        netease_url,
+        xhs_url=xhs_url,
+        image_paths=image_paths,
+        job_dir=job_dir,
+        output_root=output_root,
+        warnings=warnings,
+    )
 
     if not image_paths and not events and xhs_url.strip():
         warnings.append(
@@ -271,7 +337,13 @@ def run_match_pipeline(
         )
 
     if not image_paths and not events:
-        return PipelineResult(matches=[], playlist_artist_count=len(artists), event_count=0, warnings=warnings)
+        return PipelineResult(
+            matches=[],
+            playlist_artist_count=len(artists),
+            event_count=0,
+            warnings=warnings,
+            phase_timings=get_phase_timings(),
+        )
 
     ai_reviewer = None
     ai_only = False
@@ -286,20 +358,37 @@ def run_match_pipeline(
                 "\u670d\u52a1\u5668\u6ca1\u6709\u914d\u7f6e AI API Key\uff0c"
                 "\u5df2\u4f7f\u7528\u672c\u5730\u5339\u914d\u3002"
             )
-    result = run_match_pipeline_from_data(artists, events, ai_reviewer=ai_reviewer, ai_only=ai_only)
+    with PhaseTimer("pipeline.py", "ai_match") as match_timer:
+        result = run_match_pipeline_from_data(artists, events, ai_reviewer=ai_reviewer, ai_only=ai_only)
+        match_timer.data["matchCount"] = len(result.matches)
     result = PipelineResult(
         matches=result.matches,
         playlist_artist_count=result.playlist_artist_count,
         event_count=result.event_count,
         warnings=warnings,
     )
-    excel_path = write_matches_xlsx(result, job_dir / "matches.xlsx")
+    with PhaseTimer("pipeline.py", "write_excel") as excel_timer:
+        excel_path = write_matches_xlsx(result, job_dir / "matches.xlsx")
+        excel_timer.data["hasExcel"] = excel_path is not None
+    debug_log(
+        "pipeline.py:run_match_pipeline",
+        "pipeline complete",
+        {
+            "elapsedMs": int((time.perf_counter() - pipeline_started) * 1000),
+            "parallelLoad": _parallel_pipeline_enabled(),
+            "eventCount": result.event_count,
+            "matchCount": len(result.matches),
+            "artistCount": result.playlist_artist_count,
+        },
+        hypothesis_id="H6",
+    )
     return PipelineResult(
         matches=result.matches,
         playlist_artist_count=result.playlist_artist_count,
         event_count=result.event_count,
         excel_path=excel_path,
         warnings=result.warnings,
+        phase_timings=get_phase_timings(),
     )
 
 
@@ -323,7 +412,7 @@ def save_uploaded_images(files, upload_dir: Path) -> list[Path]:
             continue
         try:
             with Image.open(path) as img:
-                img.verify()
+                img.load()
         except Exception:
             path.unlink(missing_ok=True)
             continue

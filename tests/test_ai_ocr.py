@@ -218,6 +218,7 @@ class AiOcrTest(unittest.TestCase):
         payload = build_ai_ocr_payload(
             model="Qwen/Qwen2.5-VL-72B-Instruct",
             image_data_url="data:image/jpeg;base64,abc",
+            image_detail="high",
         )
 
         message = payload["messages"][1]
@@ -227,6 +228,15 @@ class AiOcrTest(unittest.TestCase):
         self.assertEqual(message["content"][0]["image_url"]["detail"], "high")
         self.assertIn("JSON", message["content"][1]["text"])
         self.assertIn("穷尽", message["content"][1]["text"])
+
+    def test_build_ai_ocr_payload_defaults_image_detail_to_auto(self):
+        payload = build_ai_ocr_payload(
+            model="Qwen/Qwen2.5-VL-72B-Instruct",
+            image_data_url="data:image/jpeg;base64,abc",
+        )
+
+        message = payload["messages"][1]
+        self.assertEqual(message["content"][0]["image_url"]["detail"], "auto")
 
     def test_select_ai_ocr_events_merges_agreeing_provider_results(self):
         siliconflow = AiOcrProviderResult(

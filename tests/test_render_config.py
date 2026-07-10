@@ -1,4 +1,7 @@
 from pathlib import Path
+import os
+import json
+import time
 import unittest
 
 
@@ -18,3 +21,6 @@ class RenderConfigTest(unittest.TestCase):
         self.assertIn('value: "true"', text)
         self.assertIn("Qwen/Qwen3-VL-32B-Instruct", text)
         self.assertIn("glm-4.6v", text)
+        self.assertIn("key: AI_OCR_MAX_WIDTH", text)
+        self.assertIn('value: "4096"', text)
+        self.assertNotIn("--threads 2", text)

@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --bind 0.0.0.0:$PORT --worker-class gthread --threads 2 --workers 1 --timeout 600 app:app
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --worker-class sync --workers 1 --timeout 600 app:app
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.7
@@ -20,6 +20,8 @@ services:
         value: "2"
       - key: NETEASE_MAX_WORKERS
         value: "2"
+      - key: PIPELINE_PARALLEL_LOAD
+        value: "true"
       - key: AI_MATCH_ENABLED
         value: "true"
       - key: AI_MATCH_BASE_URL
@@ -35,7 +37,7 @@ services:
       - key: AI_MATCH_EVENT_BATCH_SIZE
         value: "20"
       - key: AI_MATCH_EVENT_WORKERS
-        value: "2"
+        value: "1"
       - key: AI_OCR_ENABLED
         value: "true"
       - key: AI_OCR_PROVIDER_1_NAME
@@ -57,9 +59,13 @@ services:
       - key: AI_OCR_IMAGE_BATCH_SIZE
         value: "1"
       - key: AI_OCR_IMAGE_WORKERS
-        value: "2"
+        value: "1"
+      - key: AI_OCR_IMAGE_DETAIL
+        value: auto
+      - key: AI_OCR_MAX_WIDTH
+        value: "1200"
       - key: AI_OCR_MAX_TOKENS
-        value: "8192"
+        value: "4096"
       - key: AI_OCR_TIMEOUT_SECONDS
         value: "90"
       - key: AI_OCR_LOCAL_FALLBACK

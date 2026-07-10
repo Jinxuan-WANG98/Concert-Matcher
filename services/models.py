@@ -44,3 +44,4 @@ class PipelineResult:
     event_count: int
     excel_path: Path | None = None
     warnings: list[str] = field(default_factory=list)
+    phase_timings: list[dict] = field(default_factory=list)

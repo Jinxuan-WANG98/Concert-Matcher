@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from pathlib import Path
 from urllib.error import HTTPError
@@ -10,6 +11,7 @@ try:
 except ImportError as exc:
     raise RuntimeError("Flask is not installed. Run `pip install -r requirements.txt` before starting the web app.") from exc
 
+from services.debug_timing import debug_log
 from services.pipeline import run_match_pipeline, save_uploaded_images
 
 
@@ -66,6 +68,20 @@ def api_match():
     if not xhs_url and not uploaded:
         return jsonify({"error": "\u8bf7\u586b\u5199\u5c0f\u7ea2\u4e66\u94fe\u63a5\uff0c\u6216\u4e0a\u4f20\u5c0f\u7ea2\u4e66\u56fe\u7247"}), 400
 
+    # #region agent log
+    request_started = time.perf_counter()
+    debug_log(
+        "app.py:api_match",
+        "match request started",
+        {
+            "uploadedImageCount": len(uploaded),
+            "hasXhsUrl": bool(xhs_url),
+            "useAi": use_ai,
+        },
+        hypothesis_id="H5",
+    )
+    # #endregion
+
     try:
         result = run_match_pipeline(
             netease_url,
@@ -79,7 +95,29 @@ def api_match():
             return jsonify({"error": FORBIDDEN_EXTERNAL_MESSAGE}), 502
         return jsonify({"error": f"外部服务请求失败：HTTP {exc.code}"}), 502
     except Exception as exc:
+        # #region agent log
+        debug_log(
+            "app.py:api_match",
+            "match request failed",
+            {"error": str(exc)},
+            hypothesis_id="H5",
+        )
+        # #endregion
         return jsonify({"error": str(exc)}), 500
+
+    # #region agent log
+    debug_log(
+        "app.py:api_match",
+        "match request completed",
+        {
+            "elapsedMs": int((time.perf_counter() - request_started) * 1000),
+            "eventCount": result.event_count,
+            "matchCount": len(result.matches),
+            "warningCount": len(result.warnings),
+        },
+        hypothesis_id="H5",
+    )
+    # #endregion
 
     download_url = f"/download/{result.excel_path.parent.name}" if result.excel_path else ""
     return jsonify(
@@ -100,6 +138,8 @@ def api_match():
             "event_count": result.event_count,
             "warnings": result.warnings,
             "download_url": download_url,
+            "phase_timings": result.phase_timings,
+            "total_elapsed_ms": int((time.perf_counter() - request_started) * 1000),
         }
     )
 

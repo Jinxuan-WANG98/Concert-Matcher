@@ -4,12 +4,14 @@ import json
 import os
 import socket
 import hashlib
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib import request
 
+from services.debug_timing import PhaseTimer, debug_log
 from services.models import EventRow, PlaylistArtist
 from services.ocr_cache import cache_enabled, cache_root
 
@@ -519,52 +521,68 @@ class AiArtistReviewer:
         if not self.config.enabled or not events or not artists:
             return {}
 
-        self.last_failures = []
-        cached = _load_match_cache(events, artists, self.config.cache_source, self.output_root)
-        if cached is not None:
-            return cached
+        with PhaseTimer("ai_matcher.py:find_best_matches", "ai_match_total") as timer:
+            timer.data = {
+                "eventCount": len(events),
+                "artistCount": len(artists),
+                "mode": self.config.mode,
+            }
+            self.last_failures = []
+            cached = _load_match_cache(events, artists, self.config.cache_source, self.output_root)
+            if cached is not None:
+                timer.data["cacheHit"] = True
+                timer.data["suggestionCount"] = len(cached)
+                return cached
 
-        if len(events) > LARGE_EVENT_SET_SINGLE_PASS_THRESHOLD:
-            suggestions = self._find_best_matches_for_candidate_groups(events, artists)
-            if not self.last_failures:
-                _save_match_cache(events, artists, self.config.cache_source, suggestions, self.output_root)
-            return suggestions
+            if len(events) > LARGE_EVENT_SET_SINGLE_PASS_THRESHOLD:
+                suggestions = self._find_best_matches_for_candidate_groups(events, artists)
+                if not self.last_failures:
+                    _save_match_cache(events, artists, self.config.cache_source, suggestions, self.output_root)
+                timer.data["suggestionCount"] = len(suggestions)
+                timer.data["failureCount"] = len(self.last_failures)
+                return suggestions
 
-        batch_size = max(1, self.config.event_batch_size)
-        batches = [(start_index, batch) for start_index, batch in enumerate(_chunked(events, batch_size))]
-        batches = [(index * batch_size, batch) for index, batch in batches]
-        suggestions: dict[int, AiMatchSuggestion] = {}
-        worker_count = min(max(1, self.config.event_workers), len(batches))
-        if worker_count <= 1:
-            for start_index, batch in batches:
-                try:
-                    suggestions = _merge_suggestions(
-                        suggestions,
-                        self._find_best_matches_batch(batch, artists, start_index=start_index),
-                    )
-                except Exception as exc:
-                    self.last_failures.append(exc)
+            batch_size = max(1, self.config.event_batch_size)
+            batches = [(start_index, batch) for start_index, batch in enumerate(_chunked(events, batch_size))]
+            batches = [(index * batch_size, batch) for index, batch in batches]
+            suggestions: dict[int, AiMatchSuggestion] = {}
+            worker_count = min(max(1, self.config.event_workers), len(batches))
+            if worker_count <= 1:
+                for start_index, batch in batches:
+                    try:
+                        suggestions = _merge_suggestions(
+                            suggestions,
+                            self._find_best_matches_batch(batch, artists, start_index=start_index),
+                        )
+                    except Exception as exc:
+                        self.last_failures.append(exc)
+                if len(self.last_failures) == len(batches):
+                    raise self.last_failures[0]
+                if not self.last_failures:
+                    _save_match_cache(events, artists, self.config.cache_source, suggestions, self.output_root)
+                timer.data["suggestionCount"] = len(suggestions)
+                timer.data["failureCount"] = len(self.last_failures)
+                timer.data["batchCount"] = len(batches)
+                return suggestions
+
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = {
+                    executor.submit(self._find_best_matches_batch, batch, artists, start_index): start_index
+                    for start_index, batch in batches
+                }
+                for future in as_completed(futures):
+                    try:
+                        suggestions = _merge_suggestions(suggestions, future.result())
+                    except Exception as exc:
+                        self.last_failures.append(exc)
             if len(self.last_failures) == len(batches):
                 raise self.last_failures[0]
             if not self.last_failures:
                 _save_match_cache(events, artists, self.config.cache_source, suggestions, self.output_root)
+            timer.data["suggestionCount"] = len(suggestions)
+            timer.data["failureCount"] = len(self.last_failures)
+            timer.data["batchCount"] = len(batches)
             return suggestions
-
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = {
-                executor.submit(self._find_best_matches_batch, batch, artists, start_index): start_index
-                for start_index, batch in batches
-            }
-            for future in as_completed(futures):
-                try:
-                    suggestions = _merge_suggestions(suggestions, future.result())
-                except Exception as exc:
-                    self.last_failures.append(exc)
-        if len(self.last_failures) == len(batches):
-            raise self.last_failures[0]
-        if not self.last_failures:
-            _save_match_cache(events, artists, self.config.cache_source, suggestions, self.output_root)
-        return suggestions
 
     def _find_best_matches_for_candidate_groups(
         self,
