@@ -64,7 +64,7 @@ class AiMatcherTest(unittest.TestCase):
             model="text-model",
         )
 
-        self.assertTrue(config.cache_source.startswith("ai-match:v4:"))
+        self.assertTrue(config.cache_source.startswith("ai-match:v5:"))
 
     def test_config_loads_event_batch_size(self):
         old_values = {
@@ -292,6 +292,41 @@ class AiMatcherTest(unittest.TestCase):
         self.assertEqual(suggestions[0].artist_name, "Zella Day")
         self.assertEqual(suggestions[1].artist_name, "PREP")
         self.assertEqual(suggestions[2].artist_name, "Hanser")
+
+    def test_reviewer_matches_large_event_set_in_one_compact_request(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+            candidate_limit=2,
+            event_batch_size=2,
+            event_workers=1,
+        )
+        reviewer = AiArtistReviewer(config)
+        calls = []
+
+        def fake_chat(payload):
+            content = payload["messages"][-1]["content"]
+            calls.append(json.loads(content.split("JSON:\n", 1)[1]))
+            return '{"matches":[{"event_index":4,"artist_name":"Artist 4","confidence":"高","reason":"same"}]}'
+
+        reviewer._chat_content = fake_chat
+        events = [
+            EventRow(date_text=f"8.{index + 1}", performer=f"Artist {index}", venue="MAO")
+            for index in range(51)
+        ]
+        artists = [
+            PlaylistArtist(name=f"Artist {index}", song_count=1, sample_songs=["Song"])
+            for index in range(5)
+        ]
+
+        suggestions = reviewer.find_best_matches(events, artists)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([item["event_index"] for item in calls[0]["events"]], list(range(51)))
+        self.assertEqual(calls[0]["playlist_candidates"], [{"name": f"Artist {index}"} for index in range(5)])
+        self.assertEqual(suggestions[4].artist_name, "Artist 4")
 
     def test_reviewer_runs_event_batches_in_parallel(self):
         config = AiMatchConfig(

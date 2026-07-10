@@ -13,6 +13,8 @@ from urllib import request
 from services.models import EventRow, PlaylistArtist
 from services.ocr_cache import cache_enabled, cache_root
 
+LARGE_EVENT_SET_SINGLE_PASS_THRESHOLD = 50
+
 
 @dataclass(frozen=True)
 class AiDecision:
@@ -72,7 +74,7 @@ class AiMatchConfig:
 
     @property
     def cache_source(self) -> str:
-        return f"ai-match:v4:{self.base_url}:{self.model}:c{self.candidate_limit}:mode{self.mode}"
+        return f"ai-match:v5:{self.base_url}:{self.model}:c{self.candidate_limit}:mode{self.mode}"
 
 
 def build_review_payload(event: EventRow, artist: PlaylistArtist, model: str = "gpt-4.1-mini") -> dict[str, Any]:
@@ -155,8 +157,9 @@ def build_batch_artist_pick_payload(
     events: list[EventRow],
     artists: list[PlaylistArtist],
     model: str = "gpt-4.1-mini",
-    candidate_limit: int = 120,
+    candidate_limit: int | None = 120,
     start_index: int = 0,
+    compact_candidates: bool = False,
 ) -> dict[str, Any]:
     system = (
         "\u4f60\u662f\u6b4c\u624b\u540d\u79f0\u6279\u91cf\u5339\u914d\u5668\u3002"
@@ -185,13 +188,16 @@ def build_batch_artist_pick_payload(
         }
         for index, event in enumerate(events)
     ]
+    selected_artists = artists if candidate_limit is None else artists[:candidate_limit]
     candidates = [
-        {
+        {"name": artist.name}
+        if compact_candidates
+        else {
             "name": artist.name,
             "song_count": artist.song_count,
             "sample_songs": artist.sample_songs[:5],
         }
-        for artist in artists[:candidate_limit]
+        for artist in selected_artists
     ]
     user = {
         "events": event_items,
@@ -518,6 +524,11 @@ class AiArtistReviewer:
         if cached is not None:
             return cached
 
+        if len(events) > LARGE_EVENT_SET_SINGLE_PASS_THRESHOLD:
+            suggestions = self._find_best_matches_single_pass(events, artists)
+            _save_match_cache(events, artists, self.config.cache_source, suggestions, self.output_root)
+            return suggestions
+
         batch_size = max(1, self.config.event_batch_size)
         batches = [(start_index, batch) for start_index, batch in enumerate(_chunked(events, batch_size))]
         batches = [(index * batch_size, batch) for index, batch in batches]
@@ -553,6 +564,34 @@ class AiArtistReviewer:
         if not self.last_failures:
             _save_match_cache(events, artists, self.config.cache_source, suggestions, self.output_root)
         return suggestions
+
+    def _find_best_matches_single_pass(
+        self,
+        events: list[EventRow],
+        artists: list[PlaylistArtist],
+    ) -> dict[int, AiMatchSuggestion]:
+        payload = build_batch_artist_pick_payload(
+            events,
+            artists,
+            model=self.config.model,
+            candidate_limit=None,
+            start_index=0,
+            compact_candidates=True,
+        )
+        try:
+            return self._parse_with_ai_repair(
+                self._chat_content(payload),
+                parse_ai_batch_match_suggestions,
+                '{"matches":[{"event_index": number, "artist_name": string, "confidence": "\u9ad8|\u4e2d|\u4f4e", "reason": string}]}',
+            )
+        except Exception as exc:
+            if not _is_timeout_error(exc) or len(events) <= 1:
+                raise
+            midpoint = len(events) // 2
+            return _merge_suggestions(
+                self._find_best_matches_single_pass(events[:midpoint], artists),
+                self._find_best_matches_single_pass(events[midpoint:], artists),
+            )
 
     def _find_best_matches_batch(
         self,
