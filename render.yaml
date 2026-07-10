@@ -35,7 +35,7 @@ services:
       - key: AI_MATCH_CANDIDATE_LIMIT
         value: "120"
       - key: AI_MATCH_EVENT_BATCH_SIZE
-        value: "20"
+        value: "15"
       - key: AI_MATCH_EVENT_WORKERS
         value: "1"
       - key: AI_OCR_ENABLED
@@ -59,7 +59,7 @@ services:
       - key: AI_OCR_IMAGE_BATCH_SIZE
         value: "1"
       - key: AI_OCR_IMAGE_WORKERS
-        value: "1"
+        value: "2"
       - key: AI_OCR_IMAGE_DETAIL
         value: auto
       - key: AI_OCR_MAX_WIDTH

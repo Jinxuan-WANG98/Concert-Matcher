@@ -323,18 +323,14 @@ class AiMatcherTest(unittest.TestCase):
 
         suggestions = reviewer.find_best_matches(events, artists)
 
-        self.assertEqual(len(calls), 3)
+        # 51 events / batch 2 => 26 event batches; 5 artists / limit 2 => 3 candidate batches
+        self.assertEqual(len(calls), 78)
+        self.assertTrue(all(len(item["events"]) <= 2 for item in calls))
         self.assertEqual(
-            [item["playlist_candidates"] for item in calls],
-            [
-                [{"name": "Artist 0"}, {"name": "Artist 1"}],
-                [{"name": "Artist 2"}, {"name": "Artist 3"}],
-                [{"name": "Artist 4"}],
-            ],
+            calls[0]["playlist_candidates"],
+            [{"name": "Artist 0"}, {"name": "Artist 1"}],
         )
-        self.assertTrue(
-            all([item["event_index"] for item in call["events"]] == list(range(51)) for call in calls)
-        )
+        self.assertEqual([item["event_index"] for item in calls[0]["events"]], [0, 1])
         self.assertEqual(suggestions[4].artist_name, "Artist 4")
 
     def test_reviewer_runs_event_batches_in_parallel(self):

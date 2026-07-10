@@ -49,6 +49,8 @@ class AiOcrConfig:
     min_agreement_ratio: float = 0.2
     min_events: int = 1
     image_detail: str = "auto"
+    provider_fallback: bool = True
+    jpeg_quality: int = 85
 
     @classmethod
     def from_env(cls) -> "AiOcrConfig":
@@ -66,6 +68,9 @@ class AiOcrConfig:
             min_agreement_ratio=float(os.environ.get("AI_OCR_MIN_AGREEMENT_RATIO", "0.2")),
             min_events=int(os.environ.get("AI_OCR_MIN_EVENTS", "1")),
             image_detail=_ocr_image_detail(),
+            provider_fallback=os.environ.get("AI_OCR_PROVIDER_FALLBACK", "true").lower()
+            not in {"0", "false", "no", "off"},
+            jpeg_quality=max(60, min(95, int(os.environ.get("AI_OCR_JPEG_QUALITY", "88")))),
         )
 
     @property
@@ -351,13 +356,13 @@ def select_ai_ocr_events(
     return _merge_event_lists([result.events for result in complete_results])
 
 
-def _image_path_to_data_url(image_path: Path, max_width: int) -> str:
+def _image_path_to_data_url(image_path: Path, max_width: int, jpeg_quality: int = 85) -> str:
     with Image.open(image_path) as image:
         if image.width > max_width:
             image.thumbnail((max_width, max_width * 4), Image.Resampling.LANCZOS)
         image = image.convert("RGB")
         output = io.BytesIO()
-        image.save(output, format="JPEG", quality=88)
+        image.save(output, format="JPEG", quality=jpeg_quality)
     encoded = base64.b64encode(output.getvalue()).decode("ascii")
     return f"data:image/jpeg;base64,{encoded}"
 
@@ -372,6 +377,7 @@ class AiOcrClient:
         image_workers: int | None = None,
         max_tokens: int | None = None,
         image_detail: str | None = None,
+        jpeg_quality: int | None = None,
     ):
         if isinstance(provider, AiOcrConfig):
             config = provider
@@ -382,6 +388,7 @@ class AiOcrClient:
             image_workers = config.image_workers
             max_tokens = config.max_tokens
             image_detail = config.image_detail
+            jpeg_quality = config.jpeg_quality
         self.provider = provider
         self.timeout_seconds = timeout_seconds or 45
         self.max_width = max_width or 1600
@@ -389,6 +396,7 @@ class AiOcrClient:
         self.image_workers = max(1, image_workers or 2)
         self.max_tokens = max(512, max_tokens or 8192)
         self.image_detail = image_detail or _ocr_image_detail()
+        self.jpeg_quality = max(60, min(95, jpeg_quality or 88))
 
     def extract_events(self, image_paths: list[Path]) -> list[EventRow]:
         if self.provider is None:
@@ -440,7 +448,9 @@ class AiOcrClient:
         return result["choices"][0]["message"]["content"]
 
     def _extract_batch_events(self, image_paths: list[Path]) -> list[EventRow]:
-        image_data_urls = [_image_path_to_data_url(image_path, self.max_width) for image_path in image_paths]
+        image_data_urls = [
+            _image_path_to_data_url(image_path, self.max_width, self.jpeg_quality) for image_path in image_paths
+        ]
         payload = build_ai_ocr_payload(
             self.provider.model,
             image_data_urls,
@@ -533,7 +543,10 @@ def _extract_batch_with_provider_fallback(
     config: AiOcrConfig,
 ) -> AiOcrProviderResult:
     errors: list[str] = []
-    for provider in _provider_order(providers, start_index):
+    provider_list = _provider_order(providers, start_index)
+    if not config.provider_fallback:
+        provider_list = provider_list[:1]
+    for provider in provider_list:
         client = AiOcrClient(
             provider,
             timeout_seconds=config.timeout_seconds,
@@ -542,6 +555,7 @@ def _extract_batch_with_provider_fallback(
             image_workers=1,
             max_tokens=config.max_tokens,
             image_detail=config.image_detail,
+            jpeg_quality=config.jpeg_quality,
         )
         try:
             events = client._extract_batch_events_resilient(batch)
@@ -567,6 +581,9 @@ def extract_events_with_ai_ocr(image_paths: list[Path], warnings: list[str]) -> 
             "batchSize": config.image_batch_size,
             "imageWorkers": config.image_workers,
             "imageDetail": config.image_detail,
+            "providerFallback": config.provider_fallback,
+            "maxWidth": config.max_width,
+            "jpegQuality": config.jpeg_quality,
         }
         debug_log(
             "ai_ocr.py:extract_events_with_ai_ocr",

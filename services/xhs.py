@@ -18,6 +18,7 @@ HEADERS = {
 
 _DEFAULT_WORKERS = 2 if sys.platform == "win32" else 4
 _XHS_MAX_WORKERS = max(1, min(6, int(os.environ.get("XHS_MAX_WORKERS", str(_DEFAULT_WORKERS)))))
+_XHS_MAX_IMAGES = max(1, min(20, int(os.environ.get("XHS_MAX_IMAGES", "20"))))
 
 # #region agent log
 _DEBUG_LOG_PATH = Path(__file__).resolve().parents[1] / "debug-1c03fb.log"
@@ -64,8 +65,9 @@ def fetch_note_html(note_url: str, timeout: int = 25) -> str:
         return response.read().decode("utf-8", errors="replace")
 
 
-def fetch_note_image_urls(note_url: str, max_images: int = 20) -> list[str]:
-    return extract_note_image_urls(fetch_note_html(note_url))[:max_images]
+def fetch_note_image_urls(note_url: str, max_images: int | None = None) -> list[str]:
+    limit = _XHS_MAX_IMAGES if max_images is None else max(1, min(20, max_images))
+    return extract_note_image_urls(fetch_note_html(note_url))[:limit]
 
 
 def _remove_existing_variants(output_dir: Path, index: int) -> None:

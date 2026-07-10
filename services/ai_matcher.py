@@ -590,15 +590,43 @@ class AiArtistReviewer:
         artists: list[PlaylistArtist],
     ) -> dict[int, AiMatchSuggestion]:
         candidate_batches = _chunked(artists, max(1, self.config.candidate_limit))
+        event_batch_size = max(1, self.config.event_batch_size)
+        event_batches = [
+            (index * event_batch_size, batch)
+            for index, batch in enumerate(_chunked(events, event_batch_size))
+        ]
+        work_items = [
+            (event_batch, artist_batch, start_index)
+            for artist_batch in candidate_batches
+            for start_index, event_batch in event_batches
+        ]
+        # #region agent log
+        debug_log(
+            "ai_matcher.py:_find_best_matches_for_candidate_groups",
+            "large event match plan",
+            {
+                "eventCount": len(events),
+                "artistCount": len(artists),
+                "eventBatchSize": event_batch_size,
+                "eventBatchCount": len(event_batches),
+                "candidateBatchCount": len(candidate_batches),
+                "apiCallCount": len(work_items),
+            },
+            hypothesis_id="H7",
+        )
+        # #endregion
         suggestions: dict[int, AiMatchSuggestion] = {}
-        worker_count = min(max(1, self.config.event_workers), len(candidate_batches))
+        worker_count = min(max(1, self.config.event_workers), len(work_items))
         if worker_count <= 1:
-            for artist_batch in candidate_batches:
+            for event_batch, artist_batch, start_index in work_items:
                 try:
                     suggestions = _merge_suggestions(
                         suggestions,
                         self._find_best_matches_batch_for_candidates(
-                            events, artist_batch, start_index=0, compact_candidates=True
+                            event_batch,
+                            artist_batch,
+                            start_index=start_index,
+                            compact_candidates=True,
                         ),
                     )
                 except Exception as exc:
@@ -608,12 +636,12 @@ class AiArtistReviewer:
                 futures = [
                     executor.submit(
                         self._find_best_matches_batch_for_candidates,
-                        events,
+                        event_batch,
                         artist_batch,
-                        0,
+                        start_index,
                         True,
                     )
-                    for artist_batch in candidate_batches
+                    for event_batch, artist_batch, start_index in work_items
                 ]
                 for future in as_completed(futures):
                     try:
@@ -621,7 +649,7 @@ class AiArtistReviewer:
                     except Exception as exc:
                         self.last_failures.append(exc)
 
-        if len(self.last_failures) == len(candidate_batches):
+        if len(self.last_failures) == len(work_items):
             raise self.last_failures[0]
         return suggestions
 
