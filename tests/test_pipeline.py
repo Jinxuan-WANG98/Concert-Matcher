@@ -15,6 +15,26 @@ from services.pipeline import run_match_pipeline, run_match_pipeline_from_data, 
 
 
 class PipelineTest(unittest.TestCase):
+    def test_safe_ai_reviewer_keeps_trying_after_one_single_match_failure(self):
+        class FlakyReviewer:
+            def __init__(self):
+                self.calls = 0
+
+            def find_best_match(self, event, artists):
+                self.calls += 1
+                if self.calls == 1:
+                    raise TimeoutError("first request timed out")
+                return "second-result"
+
+        warnings = []
+        reviewer = pipeline._SafeAiReviewer(FlakyReviewer(), warnings)
+        event = EventRow(date_text="8.27", performer="Zella Day", venue="")
+        artists = [PlaylistArtist(name="Zella Day", song_count=1, sample_songs=[])]
+
+        self.assertIsNone(reviewer.find_best_match(event, artists))
+        self.assertEqual(reviewer.find_best_match(event, artists), "second-result")
+        self.assertEqual(len(warnings), 1)
+
     def test_pipeline_matches_and_exports_required_columns(self):
         artists = [
             PlaylistArtist(name="Jackson Wang", song_count=7, sample_songs=["WOLO", "LMLY"]),

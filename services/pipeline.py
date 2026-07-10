@@ -52,17 +52,15 @@ class _SafeAiReviewer:
     def __init__(self, reviewer, warnings: list[str]):
         self._reviewer = reviewer
         self._warnings = warnings
-        self._failed = False
+        self._warning_recorded = False
 
     def _warn_once(self, exc: Exception) -> None:
-        if self._failed:
+        if self._warning_recorded:
             return
-        self._failed = True
-        self._warnings.append(f"AI 匹配失败：{describe_ai_exception(exc)}")
+        self._warning_recorded = True
+        self._warnings.append(f"AI 匹配失败（部分）：{describe_ai_exception(exc)}")
 
     def review(self, event: EventRow, artist: PlaylistArtist):
-        if self._failed:
-            return None
         try:
             return self._reviewer.review(event, artist)
         except Exception as exc:
@@ -70,7 +68,7 @@ class _SafeAiReviewer:
             return None
 
     def find_best_match(self, event: EventRow, artists: list[PlaylistArtist]):
-        if self._failed or not hasattr(self._reviewer, "find_best_match"):
+        if not hasattr(self._reviewer, "find_best_match"):
             return None
         try:
             return self._reviewer.find_best_match(event, artists)
@@ -79,10 +77,14 @@ class _SafeAiReviewer:
             return None
 
     def find_best_matches(self, events: list[EventRow], artists: list[PlaylistArtist]):
-        if self._failed or not hasattr(self._reviewer, "find_best_matches"):
+        if not hasattr(self._reviewer, "find_best_matches"):
             return {}
         try:
-            return self._reviewer.find_best_matches(events, artists)
+            suggestions = self._reviewer.find_best_matches(events, artists)
+            failures = getattr(self._reviewer, "last_failures", [])
+            if failures:
+                self._warn_once(failures[0])
+            return suggestions
         except Exception as exc:
             self._warn_once(exc)
             return {}
