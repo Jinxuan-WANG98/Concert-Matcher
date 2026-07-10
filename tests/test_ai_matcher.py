@@ -56,6 +56,16 @@ class AiMatcherTest(unittest.TestCase):
         self.assertTrue(config.enabled)
         self.assertEqual(config.mode, "ai_only")
 
+    def test_config_uses_current_prompt_cache_version(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+        )
+
+        self.assertTrue(config.cache_source.startswith("ai-match:v3:"))
+
     def test_config_loads_event_batch_size(self):
         old_values = {
             "AI_MATCH_API_KEY": os.environ.pop("AI_MATCH_API_KEY", None),
@@ -206,6 +216,20 @@ class AiMatcherTest(unittest.TestCase):
         self.assertIn("ZeIIa Day", content)
         self.assertIn("Zella Day", content)
         self.assertIn("matches", payload["messages"][0]["content"])
+
+    def test_batch_payload_allows_clear_alias_and_ocr_identity_matches(self):
+        payload = build_batch_artist_pick_payload(
+            [EventRow(date_text="10.24", performer="Jackson Wang", venue="")],
+            [PlaylistArtist(name="王嘉尔", song_count=1, sample_songs=["LMLY"])],
+        )
+
+        system = payload["messages"][0]["content"]
+
+        self.assertIn("艺名", system)
+        self.assertIn("中英文", system)
+        self.assertIn("简繁", system)
+        self.assertIn("OCR", system)
+        self.assertIn("中", system)
 
     def test_parse_ai_batch_match_suggestions_accepts_matches(self):
         suggestions = parse_ai_batch_match_suggestions(
