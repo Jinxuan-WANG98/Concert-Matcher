@@ -460,6 +460,7 @@ class AiArtistReviewer:
     def __init__(self, config: AiMatchConfig | None = None, output_root: Path | None = None):
         self.config = config or AiMatchConfig.from_env()
         self.output_root = output_root
+        self.last_failures: list[Exception] = []
 
     def _chat_content(self, payload: dict[str, Any]) -> str:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -514,6 +515,7 @@ class AiArtistReviewer:
         if not self.config.enabled or not events or not artists:
             return {}
 
+        self.last_failures = []
         cached = _load_match_cache(events, artists, self.config.cache_source, self.output_root)
         if cached is not None:
             return cached
@@ -525,11 +527,17 @@ class AiArtistReviewer:
         worker_count = min(max(1, self.config.event_workers), len(batches))
         if worker_count <= 1:
             for start_index, batch in batches:
-                suggestions = _merge_suggestions(
-                    suggestions,
-                    self._find_best_matches_batch(batch, artists, start_index=start_index),
-                )
-            _save_match_cache(events, artists, self.config.cache_source, suggestions, self.output_root)
+                try:
+                    suggestions = _merge_suggestions(
+                        suggestions,
+                        self._find_best_matches_batch(batch, artists, start_index=start_index),
+                    )
+                except Exception as exc:
+                    self.last_failures.append(exc)
+            if len(self.last_failures) == len(batches):
+                raise self.last_failures[0]
+            if not self.last_failures:
+                _save_match_cache(events, artists, self.config.cache_source, suggestions, self.output_root)
             return suggestions
 
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
@@ -538,8 +546,14 @@ class AiArtistReviewer:
                 for start_index, batch in batches
             }
             for future in as_completed(futures):
-                suggestions = _merge_suggestions(suggestions, future.result())
-        _save_match_cache(events, artists, self.config.cache_source, suggestions, self.output_root)
+                try:
+                    suggestions = _merge_suggestions(suggestions, future.result())
+                except Exception as exc:
+                    self.last_failures.append(exc)
+        if len(self.last_failures) == len(batches):
+            raise self.last_failures[0]
+        if not self.last_failures:
+            _save_match_cache(events, artists, self.config.cache_source, suggestions, self.output_root)
         return suggestions
 
     def _find_best_matches_batch(

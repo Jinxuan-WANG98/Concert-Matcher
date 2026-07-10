@@ -316,6 +316,98 @@ class AiMatcherTest(unittest.TestCase):
         self.assertEqual(max_active_count, 2)
         self.assertEqual(set(suggestions), {0, 1})
 
+    def test_reviewer_keeps_successful_parallel_batches_when_one_batch_fails(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+            event_batch_size=1,
+            event_workers=2,
+        )
+        reviewer = AiArtistReviewer(config)
+
+        def fake_batch(batch, artists, start_index):
+            if start_index == 0:
+                raise RuntimeError("provider rejected this batch")
+            return {
+                start_index: AiMatchSuggestion(
+                    artist_name="PREP",
+                    confidence="高",
+                    reason="other batch succeeded",
+                )
+            }
+
+        reviewer._find_best_matches_batch = fake_batch
+        events = [
+            EventRow(date_text="8.27", performer="Zella Day", venue="MAO"),
+            EventRow(date_text="9.01", performer="PREP", venue="Modern Sky"),
+        ]
+        artists = [
+            PlaylistArtist(name="Zella Day", song_count=1, sample_songs=[]),
+            PlaylistArtist(name="PREP", song_count=1, sample_songs=[]),
+        ]
+
+        suggestions = reviewer.find_best_matches(events, artists)
+
+        self.assertEqual(set(suggestions), {1})
+        self.assertEqual(suggestions[1].artist_name, "PREP")
+        self.assertEqual(len(reviewer.last_failures), 1)
+
+    def test_reviewer_does_not_cache_partial_batch_results(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+            event_batch_size=1,
+            event_workers=1,
+        )
+        events = [
+            EventRow(date_text="8.27", performer="Zella Day", venue="MAO"),
+            EventRow(date_text="9.01", performer="PREP", venue="Modern Sky"),
+        ]
+        artists = [
+            PlaylistArtist(name="Zella Day", song_count=1, sample_songs=[]),
+            PlaylistArtist(name="PREP", song_count=1, sample_songs=[]),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            reviewer = AiArtistReviewer(config, output_root=Path(tmp))
+
+            def partially_failing_batch(batch, artists, start_index):
+                if start_index == 0:
+                    raise RuntimeError("provider rejected this batch")
+                return {
+                    1: AiMatchSuggestion(
+                        artist_name="PREP",
+                        confidence="高",
+                        reason="second batch succeeded",
+                    )
+                }
+
+            reviewer._find_best_matches_batch = partially_failing_batch
+            first = reviewer.find_best_matches(events, artists)
+
+            calls = []
+
+            def successful_batch(batch, artists, start_index):
+                calls.append(start_index)
+                return {
+                    start_index: AiMatchSuggestion(
+                        artist_name=artists[start_index].name,
+                        confidence="高",
+                        reason="retry succeeded",
+                    )
+                }
+
+            reviewer._find_best_matches_batch = successful_batch
+            second = reviewer.find_best_matches(events, artists)
+
+        self.assertEqual(set(first), {1})
+        self.assertEqual(calls, [0, 1])
+        self.assertEqual(set(second), {0, 1})
+
     def test_reviewer_reuses_cached_batch_suggestions(self):
         config = AiMatchConfig(
             enabled=True,
