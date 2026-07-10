@@ -274,6 +274,12 @@ button:disabled {
   margin-bottom: 18px;
 }
 
+.result-summary {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-weight: 700;
+}
+
 .warnings {
   margin-bottom: 14px;
   padding: 12px 14px;

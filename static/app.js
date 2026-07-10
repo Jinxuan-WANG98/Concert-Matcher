@@ -4,6 +4,7 @@ const statusPanel = document.querySelector("#status");
 const fileWarning = document.querySelector("#file-warning");
 const resultPanel = document.querySelector("#result-panel");
 const resultsBody = document.querySelector("#results-body");
+const resultSummary = document.querySelector("#result-summary");
 const warningsBox = document.querySelector("#warnings");
 const downloadLink = document.querySelector("#download-link");
 
@@ -60,6 +61,10 @@ function confidenceClass(value) {
 function renderResults(data) {
   resultsBody.innerHTML = "";
   const matches = data.matches || [];
+  const eventCount = Number.isInteger(data.event_count) ? data.event_count : null;
+  resultSummary.textContent = eventCount == null
+    ? `匹配到 ${matches.length} 位歌手`
+    : `识别到 ${eventCount} 场演出，匹配到 ${matches.length} 位歌手`;
 
   if (matches.length === 0) {
     const row = document.createElement("tr");

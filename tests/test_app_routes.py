@@ -28,6 +28,7 @@ class AppRoutesTest(unittest.TestCase):
         self.assertIn("AI \u590d\u6838", unescaped)
         self.assertIn('name="use_ai"', body)
         self.assertIn('name="use_ai" type="checkbox" checked', body)
+        self.assertIn('id="result-summary"', body)
 
     def test_match_endpoint_returns_clear_error_for_missing_playlist(self):
         client = app.app.test_client()
