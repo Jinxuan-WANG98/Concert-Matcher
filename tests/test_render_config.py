@@ -17,4 +17,4 @@ class RenderConfigTest(unittest.TestCase):
         self.assertIn('key: AI_OCR_PROVIDER_2_ENABLED', text)
         self.assertIn('value: "true"', text)
         self.assertIn("Qwen/Qwen3-VL-32B-Instruct", text)
-        self.assertIn("GLM-4V-Flash", text)
+        self.assertIn("glm-4.6v", text)
