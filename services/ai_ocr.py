@@ -44,41 +44,50 @@ class AiOcrConfig:
     max_width: int = 1600
     image_batch_size: int = 8
     image_workers: int = 2
-    max_tokens: int = 8192
     local_fallback_enabled: bool = False
-    min_agreement_ratio: float = 0.2
-    min_events: int = 1
     image_detail: str = "auto"
-    provider_fallback: bool = True
+    provider_fallback: bool = False
+    dual_provider: bool = False
     jpeg_quality: int = 85
 
     @classmethod
     def from_env(cls) -> "AiOcrConfig":
         enabled = os.environ.get("AI_OCR_ENABLED", "").lower() in {"1", "true", "yes", "on"}
-        providers = tuple(_providers_from_env())
+        providers = _active_ocr_providers_from_env()
+        dual_default = "true" if len(providers) > 1 else "false"
+        dual_provider = os.environ.get("AI_OCR_DUAL_PROVIDER", dual_default).lower() in {"1", "true", "yes", "on"}
+        provider_fallback = os.environ.get("AI_OCR_PROVIDER_FALLBACK", "false").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not dual_provider and len(providers) > 1:
+            primary_index = int(os.environ.get("AI_OCR_PRIMARY_PROVIDER_INDEX", "1")) - 1
+            primary_index = max(0, min(primary_index, len(providers) - 1))
+            providers = [providers[primary_index]]
+            provider_fallback = False
         return cls(
             enabled=enabled and bool(providers),
-            providers=providers,
+            providers=tuple(providers),
             timeout_seconds=int(os.environ.get("AI_OCR_TIMEOUT_SECONDS", "45")),
             max_width=int(os.environ.get("AI_OCR_MAX_WIDTH", "1600")),
             image_batch_size=max(1, int(os.environ.get("AI_OCR_IMAGE_BATCH_SIZE", "8"))),
             image_workers=max(1, int(os.environ.get("AI_OCR_IMAGE_WORKERS", "2"))),
-            max_tokens=max(512, int(os.environ.get("AI_OCR_MAX_TOKENS", "8192"))),
             local_fallback_enabled=os.environ.get("AI_OCR_LOCAL_FALLBACK", "").lower() in {"1", "true", "yes", "on"},
-            min_agreement_ratio=float(os.environ.get("AI_OCR_MIN_AGREEMENT_RATIO", "0.2")),
-            min_events=int(os.environ.get("AI_OCR_MIN_EVENTS", "1")),
             image_detail=_ocr_image_detail(),
-            provider_fallback=os.environ.get("AI_OCR_PROVIDER_FALLBACK", "true").lower()
-            not in {"0", "false", "no", "off"},
+            provider_fallback=provider_fallback,
+            dual_provider=dual_provider,
             jpeg_quality=max(60, min(95, int(os.environ.get("AI_OCR_JPEG_QUALITY", "88")))),
         )
 
     @property
     def cache_source(self) -> str:
         provider_source = "|".join(f"{provider.name}:{provider.model}:{provider.base_url}" for provider in self.providers)
+        mode = "dual" if self.dual_provider else "single"
         return (
-            f"ai-ocr:v3-distributed:{provider_source}:w{self.max_width}:"
-            f"batch{self.image_batch_size}:tok{self.max_tokens}:min{self.min_events}"
+            f"ai-ocr:v5-{mode}:{provider_source}:w{self.max_width}:"
+            f"batch{self.image_batch_size}"
         )
 
     @property
@@ -103,6 +112,10 @@ def _provider_api_key(prefix: str, base_url: str) -> str:
     if match_key and match_base and base_url and match_base == base_url:
         return match_key
     return ""
+
+
+def _active_ocr_providers_from_env() -> list[AiOcrProviderConfig]:
+    return _providers_from_env()
 
 
 def _providers_from_env() -> list[AiOcrProviderConfig]:
@@ -149,7 +162,6 @@ def _ocr_image_detail() -> str:
 def build_ai_ocr_payload(
     model: str,
     image_data_url: str | list[str],
-    max_tokens: int = 8192,
     image_detail: str | None = None,
 ) -> dict[str, Any]:
     image_data_urls = [image_data_url] if isinstance(image_data_url, str) else list(image_data_url)
@@ -179,7 +191,6 @@ def build_ai_ocr_payload(
     return {
         "model": model,
         "temperature": 0,
-        "max_tokens": max_tokens,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": content},
@@ -187,7 +198,7 @@ def build_ai_ocr_payload(
     }
 
 
-def build_ai_ocr_repair_payload(model: str, raw_text: str, max_tokens: int = 8192) -> dict[str, Any]:
+def build_ai_ocr_repair_payload(model: str, raw_text: str) -> dict[str, Any]:
     system = (
         "你是 JSON 修复器。只修复格式，不新增、推测或改写图片中没有出现的事实。"
         "把输入整理成程序可解析的严格 JSON。"
@@ -205,7 +216,6 @@ def build_ai_ocr_repair_payload(model: str, raw_text: str, max_tokens: int = 819
     return {
         "model": model,
         "temperature": 0,
-        "max_tokens": max_tokens,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
@@ -327,33 +337,11 @@ def _merge_event_lists(event_lists: list[list[EventRow]]) -> list[EventRow]:
     return merged
 
 
-def _is_structurally_complete(events: list[EventRow], min_events: int) -> bool:
-    if len(events) < min_events:
-        return False
-    return all(event.performer.strip() and parse_date_text(event.date_text) for event in events)
-
-
-def _agreement_ratio(left: list[EventRow], right: list[EventRow]) -> float:
-    left_keys = {_event_key(event) for event in left if _event_key(event)[1]}
-    right_keys = {_event_key(event) for event in right if _event_key(event)[1]}
-    if not left_keys or not right_keys:
-        return 0.0
-    return len(left_keys & right_keys) / min(len(left_keys), len(right_keys))
-
-
-def select_ai_ocr_events(
-    results: list[AiOcrProviderResult],
-    min_agreement_ratio: float = 0.2,
-    min_events: int = 1,
-) -> list[EventRow]:
-    complete_results = [
-        result
-        for result in results
-        if not result.error and _is_structurally_complete(result.events, min_events=min_events)
-    ]
-    if not complete_results:
+def select_ai_ocr_events(results: list[AiOcrProviderResult]) -> list[EventRow]:
+    usable_results = [result for result in results if not result.error and result.events]
+    if not usable_results:
         return []
-    return _merge_event_lists([result.events for result in complete_results])
+    return _merge_event_lists([result.events for result in usable_results])
 
 
 def _image_path_to_data_url(image_path: Path, max_width: int, jpeg_quality: int = 85) -> str:
@@ -375,7 +363,6 @@ class AiOcrClient:
         max_width: int | None = None,
         image_batch_size: int | None = None,
         image_workers: int | None = None,
-        max_tokens: int | None = None,
         image_detail: str | None = None,
         jpeg_quality: int | None = None,
     ):
@@ -386,7 +373,6 @@ class AiOcrClient:
             max_width = config.max_width
             image_batch_size = config.image_batch_size
             image_workers = config.image_workers
-            max_tokens = config.max_tokens
             image_detail = config.image_detail
             jpeg_quality = config.jpeg_quality
         self.provider = provider
@@ -394,7 +380,6 @@ class AiOcrClient:
         self.max_width = max_width or 1600
         self.image_batch_size = max(1, image_batch_size or 8)
         self.image_workers = max(1, image_workers or 2)
-        self.max_tokens = max(512, max_tokens or 8192)
         self.image_detail = image_detail or _ocr_image_detail()
         self.jpeg_quality = max(60, min(95, jpeg_quality or 88))
 
@@ -454,7 +439,6 @@ class AiOcrClient:
         payload = build_ai_ocr_payload(
             self.provider.model,
             image_data_urls,
-            max_tokens=self.max_tokens,
             image_detail=self.image_detail,
         )
         content = self._chat_content(payload, call_kind="ocr")
@@ -469,7 +453,6 @@ class AiOcrClient:
                 "imageNames": [image_path.name for image_path in image_paths],
                 "eventCount": len(events),
                 "rawLength": len(content or ""),
-                "maxTokens": self.max_tokens,
                 "imageDetail": self.image_detail,
             },
             hypothesis_id="H1",
@@ -499,7 +482,7 @@ class AiOcrClient:
             )
             return []
 
-        repair_payload = build_ai_ocr_repair_payload(self.provider.model, raw_text, max_tokens=self.max_tokens)
+        repair_payload = build_ai_ocr_repair_payload(self.provider.model, raw_text)
         repaired_content = self._chat_content(repair_payload, call_kind="repair")
         return parse_ai_ocr_events(repaired_content, image_name=image_name)
 
@@ -553,7 +536,6 @@ def _extract_batch_with_provider_fallback(
             max_width=config.max_width,
             image_batch_size=config.image_batch_size,
             image_workers=1,
-            max_tokens=config.max_tokens,
             image_detail=config.image_detail,
             jpeg_quality=config.jpeg_quality,
         )
@@ -582,6 +564,7 @@ def extract_events_with_ai_ocr(image_paths: list[Path], warnings: list[str]) -> 
             "imageWorkers": config.image_workers,
             "imageDetail": config.image_detail,
             "providerFallback": config.provider_fallback,
+            "dualProvider": config.dual_provider,
             "maxWidth": config.max_width,
             "jpegQuality": config.jpeg_quality,
         }
@@ -639,11 +622,7 @@ def extract_events_with_ai_ocr(image_paths: list[Path], warnings: list[str]) -> 
                 )
 
         results = [results_by_batch[index] for index in sorted(results_by_batch)]
-        events = select_ai_ocr_events(
-            results,
-            min_agreement_ratio=config.min_agreement_ratio,
-            min_events=config.min_events,
-        )
+        events = select_ai_ocr_events(results)
         timer.data["mergedEventCount"] = len(events)
         timer.data["successfulBatches"] = len(results)
         if not events:
@@ -664,7 +643,6 @@ def extract_events_with_ai_ocr(image_paths: list[Path], warnings: list[str]) -> 
                 "successfulBatches": len(results),
                 "mergedEventCount": len(events),
                 "batchSize": config.image_batch_size,
-                "maxTokens": config.max_tokens,
                 "model": config.model,
             },
             hypothesis_id="H2",

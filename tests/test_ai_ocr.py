@@ -32,10 +32,9 @@ class AiOcrTest(unittest.TestCase):
             "AI_OCR_MAX_WIDTH",
             "AI_OCR_IMAGE_BATCH_SIZE",
             "AI_OCR_IMAGE_WORKERS",
-            "AI_OCR_MAX_TOKENS",
             "AI_OCR_LOCAL_FALLBACK",
-            "AI_OCR_MIN_AGREEMENT_RATIO",
-            "AI_OCR_MIN_EVENTS",
+            "AI_OCR_DUAL_PROVIDER",
+            "AI_OCR_PROVIDER_FALLBACK",
         ]
         for index in range(1, 5):
             names.extend(
@@ -223,7 +222,7 @@ class AiOcrTest(unittest.TestCase):
 
         message = payload["messages"][1]
         self.assertEqual(payload["model"], "Qwen/Qwen2.5-VL-72B-Instruct")
-        self.assertEqual(payload["max_tokens"], 8192)
+        self.assertNotIn("max_tokens", payload)
         self.assertEqual(message["content"][0]["type"], "image_url")
         self.assertEqual(message["content"][0]["image_url"]["detail"], "high")
         self.assertIn("JSON", message["content"][1]["text"])

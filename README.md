@@ -59,7 +59,7 @@ On small Render instances, keep `WEB_CONCURRENCY=1`, `OCR_MAX_WORKERS=1`, and `A
 
 The app can also use vision models before local OCR. This is useful for Xiaohongshu notes whose first page and later pages use different layouts. Configure these values on the server, or copy `.env.example` to `.env` for local runs. Do not put real keys in frontend code.
 
-When two providers are configured, the app splits image batches across them in parallel, repairs malformed AI JSON with AI, merges usable structured rows, and only uses local RapidOCR when `AI_OCR_LOCAL_FALLBACK=true`. AI matching results are cached for the same recognized events, playlist artists, model, and endpoint, so repeated runs can skip the matching calls.
+When two providers are configured with `AI_OCR_DUAL_PROVIDER=true`, the app rotates image batches across them in parallel (for example batch 1 to SiliconFlow, batch 2 to Zhipu), repairs malformed AI JSON with AI, merges rows by date and performer, and only uses local RapidOCR when `AI_OCR_LOCAL_FALLBACK=true`. It does not require both models to agree on the same image.
 
 ```text
 AI_OCR_ENABLED=true
@@ -74,9 +74,9 @@ AI_OCR_PROVIDER_2_BASE_URL=https://open.bigmodel.cn/api/paas/v4
 AI_OCR_PROVIDER_2_MODEL=glm-4.6v
 AI_OCR_IMAGE_BATCH_SIZE=8
 AI_OCR_IMAGE_WORKERS=2
+AI_OCR_DUAL_PROVIDER=true
+AI_OCR_PROVIDER_FALLBACK=false
 AI_OCR_LOCAL_FALLBACK=false
-AI_OCR_MIN_AGREEMENT_RATIO=0.2
-AI_OCR_MIN_EVENTS=1
 ```
 
 If AI image recognition returns malformed JSON, the app first asks AI to repair the response into the required structure. If a large image batch still fails, the app retries smaller AI batches before giving up. Local RapidOCR is not called automatically unless `AI_OCR_LOCAL_FALLBACK=true`.
