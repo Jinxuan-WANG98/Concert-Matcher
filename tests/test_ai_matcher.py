@@ -64,7 +64,7 @@ class AiMatcherTest(unittest.TestCase):
             model="text-model",
         )
 
-        self.assertTrue(config.cache_source.startswith("ai-match:v5:"))
+        self.assertTrue(config.cache_source.startswith("ai-match:v6:"))
 
     def test_config_loads_event_batch_size(self):
         old_values = {
@@ -293,7 +293,7 @@ class AiMatcherTest(unittest.TestCase):
         self.assertEqual(suggestions[1].artist_name, "PREP")
         self.assertEqual(suggestions[2].artist_name, "Hanser")
 
-    def test_reviewer_matches_large_event_set_in_one_compact_request(self):
+    def test_reviewer_matches_large_event_set_by_parallel_candidate_groups(self):
         config = AiMatchConfig(
             enabled=True,
             api_key="test-key",
@@ -323,9 +323,18 @@ class AiMatcherTest(unittest.TestCase):
 
         suggestions = reviewer.find_best_matches(events, artists)
 
-        self.assertEqual(len(calls), 1)
-        self.assertEqual([item["event_index"] for item in calls[0]["events"]], list(range(51)))
-        self.assertEqual(calls[0]["playlist_candidates"], [{"name": f"Artist {index}"} for index in range(5)])
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(
+            [item["playlist_candidates"] for item in calls],
+            [
+                [{"name": "Artist 0"}, {"name": "Artist 1"}],
+                [{"name": "Artist 2"}, {"name": "Artist 3"}],
+                [{"name": "Artist 4"}],
+            ],
+        )
+        self.assertTrue(
+            all([item["event_index"] for item in call["events"]] == list(range(51)) for call in calls)
+        )
         self.assertEqual(suggestions[4].artist_name, "Artist 4")
 
     def test_reviewer_runs_event_batches_in_parallel(self):

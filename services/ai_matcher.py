@@ -74,7 +74,7 @@ class AiMatchConfig:
 
     @property
     def cache_source(self) -> str:
-        return f"ai-match:v5:{self.base_url}:{self.model}:c{self.candidate_limit}:mode{self.mode}"
+        return f"ai-match:v6:{self.base_url}:{self.model}:c{self.candidate_limit}:mode{self.mode}"
 
 
 def build_review_payload(event: EventRow, artist: PlaylistArtist, model: str = "gpt-4.1-mini") -> dict[str, Any]:
@@ -525,8 +525,9 @@ class AiArtistReviewer:
             return cached
 
         if len(events) > LARGE_EVENT_SET_SINGLE_PASS_THRESHOLD:
-            suggestions = self._find_best_matches_single_pass(events, artists)
-            _save_match_cache(events, artists, self.config.cache_source, suggestions, self.output_root)
+            suggestions = self._find_best_matches_for_candidate_groups(events, artists)
+            if not self.last_failures:
+                _save_match_cache(events, artists, self.config.cache_source, suggestions, self.output_root)
             return suggestions
 
         batch_size = max(1, self.config.event_batch_size)
@@ -565,33 +566,46 @@ class AiArtistReviewer:
             _save_match_cache(events, artists, self.config.cache_source, suggestions, self.output_root)
         return suggestions
 
-    def _find_best_matches_single_pass(
+    def _find_best_matches_for_candidate_groups(
         self,
         events: list[EventRow],
         artists: list[PlaylistArtist],
     ) -> dict[int, AiMatchSuggestion]:
-        payload = build_batch_artist_pick_payload(
-            events,
-            artists,
-            model=self.config.model,
-            candidate_limit=None,
-            start_index=0,
-            compact_candidates=True,
-        )
-        try:
-            return self._parse_with_ai_repair(
-                self._chat_content(payload),
-                parse_ai_batch_match_suggestions,
-                '{"matches":[{"event_index": number, "artist_name": string, "confidence": "\u9ad8|\u4e2d|\u4f4e", "reason": string}]}',
-            )
-        except Exception as exc:
-            if not _is_timeout_error(exc) or len(events) <= 1:
-                raise
-            midpoint = len(events) // 2
-            return _merge_suggestions(
-                self._find_best_matches_single_pass(events[:midpoint], artists),
-                self._find_best_matches_single_pass(events[midpoint:], artists),
-            )
+        candidate_batches = _chunked(artists, max(1, self.config.candidate_limit))
+        suggestions: dict[int, AiMatchSuggestion] = {}
+        worker_count = min(max(1, self.config.event_workers), len(candidate_batches))
+        if worker_count <= 1:
+            for artist_batch in candidate_batches:
+                try:
+                    suggestions = _merge_suggestions(
+                        suggestions,
+                        self._find_best_matches_batch_for_candidates(
+                            events, artist_batch, start_index=0, compact_candidates=True
+                        ),
+                    )
+                except Exception as exc:
+                    self.last_failures.append(exc)
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = [
+                    executor.submit(
+                        self._find_best_matches_batch_for_candidates,
+                        events,
+                        artist_batch,
+                        0,
+                        True,
+                    )
+                    for artist_batch in candidate_batches
+                ]
+                for future in as_completed(futures):
+                    try:
+                        suggestions = _merge_suggestions(suggestions, future.result())
+                    except Exception as exc:
+                        self.last_failures.append(exc)
+
+        if len(self.last_failures) == len(candidate_batches):
+            raise self.last_failures[0]
+        return suggestions
 
     def _find_best_matches_batch(
         self,
@@ -616,6 +630,7 @@ class AiArtistReviewer:
         events: list[EventRow],
         artists: list[PlaylistArtist],
         start_index: int,
+        compact_candidates: bool = False,
     ) -> dict[int, AiMatchSuggestion]:
         payload = build_batch_artist_pick_payload(
             events,
@@ -623,6 +638,7 @@ class AiArtistReviewer:
             model=self.config.model,
             candidate_limit=self.config.candidate_limit,
             start_index=start_index,
+            compact_candidates=compact_candidates,
         )
         try:
             return self._parse_with_ai_repair(
@@ -641,6 +657,7 @@ class AiArtistReviewer:
                     events,
                     artists[:midpoint],
                     start_index=start_index,
+                    compact_candidates=compact_candidates,
                 )
                 return _merge_suggestions(
                     suggestions,
@@ -648,6 +665,7 @@ class AiArtistReviewer:
                         events,
                         artists[midpoint:],
                         start_index=start_index,
+                        compact_candidates=compact_candidates,
                     ),
                 )
             midpoint = len(events) // 2
@@ -655,6 +673,7 @@ class AiArtistReviewer:
                 events[:midpoint],
                 artists,
                 start_index=start_index,
+                compact_candidates=compact_candidates,
             )
             return _merge_suggestions(
                 suggestions,
@@ -662,6 +681,7 @@ class AiArtistReviewer:
                     events[midpoint:],
                     artists,
                     start_index=start_index + midpoint,
+                    compact_candidates=compact_candidates,
                 ),
             )
 
