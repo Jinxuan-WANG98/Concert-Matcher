@@ -319,9 +319,9 @@ def select_ai_ocr_events(
 
 def _image_path_to_data_url(image_path: Path, max_width: int) -> str:
     with Image.open(image_path) as image:
-        image = image.convert("RGB")
         if image.width > max_width:
             image.thumbnail((max_width, max_width * 4), Image.Resampling.LANCZOS)
+        image = image.convert("RGB")
         output = io.BytesIO()
         image.save(output, format="JPEG", quality=88)
     encoded = base64.b64encode(output.getvalue()).decode("ascii")

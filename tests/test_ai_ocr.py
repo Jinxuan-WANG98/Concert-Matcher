@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from urllib.error import HTTPError
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -107,6 +108,38 @@ class AiOcrTest(unittest.TestCase):
 
         self.assertTrue(config.enabled)
         self.assertEqual([provider.name for provider in config.providers], ["zhipu"])
+
+    def test_image_is_resized_before_rgb_conversion(self):
+        calls = []
+
+        class FakeImage:
+            width = 3200
+
+            def thumbnail(self, size, resample):
+                calls.append("thumbnail")
+
+            def convert(self, mode):
+                if calls != ["thumbnail"]:
+                    raise AssertionError("image must be resized before RGB conversion")
+                calls.append("convert")
+                return self
+
+            def save(self, output, format, quality):
+                calls.append("save")
+                output.write(b"compressed-image")
+
+        class FakeImageContext:
+            def __enter__(self):
+                return FakeImage()
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+        with patch.object(ai_ocr.Image, "open", return_value=FakeImageContext()):
+            data_url = ai_ocr._image_path_to_data_url(Path("large.jpg"), max_width=1600)
+
+        self.assertTrue(data_url.startswith("data:image/jpeg;base64,"))
+        self.assertEqual(calls, ["thumbnail", "convert", "save"])
 
     def test_parse_ai_ocr_events_accepts_strict_json(self):
         raw = """

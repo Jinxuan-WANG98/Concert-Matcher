@@ -55,7 +55,7 @@ services:
       - key: AI_OCR_PROVIDER_2_MODEL
         value: GLM-4V-Flash
       - key: AI_OCR_IMAGE_BATCH_SIZE
-        value: "8"
+        value: "4"
       - key: AI_OCR_IMAGE_WORKERS
         value: "1"
       - key: AI_OCR_LOCAL_FALLBACK
