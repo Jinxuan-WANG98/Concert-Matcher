@@ -110,6 +110,37 @@ class AiOcrTest(unittest.TestCase):
         self.assertTrue(config.enabled)
         self.assertEqual([provider.name for provider in config.providers], ["zhipu"])
 
+    def test_config_reuses_ai_match_key_for_zhipu_ocr_provider(self):
+        old_values = self._clear_ai_ocr_env()
+        old_match_key = os.environ.pop("AI_MATCH_API_KEY", None)
+        old_match_base = os.environ.pop("AI_MATCH_BASE_URL", None)
+        try:
+            os.environ["AI_OCR_ENABLED"] = "true"
+            os.environ["AI_OCR_PROVIDER_1_NAME"] = "siliconflow"
+            os.environ["AI_OCR_PROVIDER_1_API_KEY"] = "sf-key"
+            os.environ["AI_OCR_PROVIDER_1_BASE_URL"] = "https://api.siliconflow.cn/v1"
+            os.environ["AI_OCR_PROVIDER_1_MODEL"] = "sf-vl"
+            os.environ["AI_OCR_PROVIDER_2_NAME"] = "zhipu"
+            os.environ["AI_OCR_PROVIDER_2_BASE_URL"] = "https://open.bigmodel.cn/api/paas/v4"
+            os.environ["AI_OCR_PROVIDER_2_MODEL"] = "glm-v"
+            os.environ["AI_MATCH_API_KEY"] = "shared-zhipu-key"
+            os.environ["AI_MATCH_BASE_URL"] = "https://open.bigmodel.cn/api/paas/v4"
+
+            config = AiOcrConfig.from_env()
+        finally:
+            self._restore_env(old_values)
+            if old_match_key is not None:
+                os.environ["AI_MATCH_API_KEY"] = old_match_key
+            else:
+                os.environ.pop("AI_MATCH_API_KEY", None)
+            if old_match_base is not None:
+                os.environ["AI_MATCH_BASE_URL"] = old_match_base
+            else:
+                os.environ.pop("AI_MATCH_BASE_URL", None)
+
+        self.assertEqual([provider.name for provider in config.providers], ["siliconflow", "zhipu"])
+        self.assertEqual(config.providers[1].api_key, "shared-zhipu-key")
+
     def test_image_is_resized_before_rgb_conversion(self):
         calls = []
 

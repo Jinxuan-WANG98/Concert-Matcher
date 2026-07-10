@@ -86,6 +86,17 @@ class AiOcrConfig:
         return self.providers[0].model if self.providers else ""
 
 
+def _provider_api_key(prefix: str, base_url: str) -> str:
+    api_key = os.environ.get(f"{prefix}API_KEY", "").strip()
+    if api_key:
+        return api_key
+    match_key = os.environ.get("AI_MATCH_API_KEY", "").strip()
+    match_base = os.environ.get("AI_MATCH_BASE_URL", "").strip().rstrip("/")
+    if match_key and match_base and base_url and match_base == base_url:
+        return match_key
+    return ""
+
+
 def _providers_from_env() -> list[AiOcrProviderConfig]:
     providers: list[AiOcrProviderConfig] = []
     for index in range(1, 5):
@@ -93,8 +104,8 @@ def _providers_from_env() -> list[AiOcrProviderConfig]:
         provider_enabled = os.environ.get(f"{prefix}ENABLED", "true").strip().lower()
         if provider_enabled in {"0", "false", "no", "off"}:
             continue
-        api_key = os.environ.get(f"{prefix}API_KEY", "").strip()
         base_url = os.environ.get(f"{prefix}BASE_URL", "").strip().rstrip("/")
+        api_key = _provider_api_key(prefix, base_url)
         model = os.environ.get(f"{prefix}MODEL", "").strip()
         name = os.environ.get(f"{prefix}NAME", f"provider_{index}").strip() or f"provider_{index}"
         if api_key and base_url and model:
@@ -514,6 +525,19 @@ def extract_events_with_ai_ocr(image_paths: list[Path], warnings: list[str]) -> 
     config = AiOcrConfig.from_env()
     if not config.enabled or not image_paths:
         return []
+
+    # #region agent log
+    _debug_log(
+        "ai_ocr.py:extract_events_with_ai_ocr",
+        "ai ocr providers loaded",
+        {
+            "providerNames": [provider.name for provider in config.providers],
+            "providerModels": [provider.model for provider in config.providers],
+            "providerCount": len(config.providers),
+        },
+        hypothesis_id="H4",
+    )
+    # #endregion
 
     results_by_batch: dict[int, AiOcrProviderResult] = {}
     batches = list(_chunked(image_paths, config.image_batch_size))
