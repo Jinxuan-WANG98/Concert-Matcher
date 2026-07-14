@@ -41,7 +41,7 @@ class AiMatchConfig:
     base_url: str = "https://api.openai.com/v1"
     model: str = "gpt-4.1-mini"
     timeout_seconds: int = 20
-    candidate_limit: int = 1000
+    candidate_limit: int = 200
     mode: str = "review"
     event_batch_size: int = 40
     event_workers: int = 2
@@ -72,7 +72,7 @@ class AiMatchConfig:
             base_url=base_url.rstrip("/"),
             model=os.environ.get("AI_MATCH_MODEL", "gpt-4.1-mini"),
             timeout_seconds=int(os.environ.get("AI_MATCH_TIMEOUT_SECONDS", "20")),
-            candidate_limit=max(1, int(os.environ.get("AI_MATCH_CANDIDATE_LIMIT", "1000"))),
+            candidate_limit=max(1, int(os.environ.get("AI_MATCH_CANDIDATE_LIMIT", "200"))),
             mode=mode,
             event_batch_size=max(1, int(os.environ.get("AI_MATCH_EVENT_BATCH_SIZE", "40"))),
             event_workers=max(1, int(os.environ.get("AI_MATCH_EVENT_WORKERS", "2"))),

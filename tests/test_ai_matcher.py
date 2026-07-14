@@ -70,7 +70,7 @@ class AiMatcherTest(unittest.TestCase):
     def test_config_defaults_bound_calls_and_use_two_workers(self):
         config = AiMatchConfig()
 
-        self.assertEqual(config.candidate_limit, 1000)
+        self.assertEqual(config.candidate_limit, 200)
         self.assertEqual(config.event_batch_size, 40)
         self.assertEqual(config.event_workers, 2)
         self.assertEqual(config.max_calls, 20)
