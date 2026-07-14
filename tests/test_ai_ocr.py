@@ -480,6 +480,83 @@ class AiOcrTest(unittest.TestCase):
         self.assertEqual([event.performer for event in events], ["siliconflow", "zhipu"])
         self.assertIn("分批并行", " ".join(warnings))
 
+    def test_extract_events_with_ai_ocr_rechecks_low_row_batch_with_next_provider(self):
+        old_values = self._clear_ai_ocr_env()
+        original_extract = ai_ocr.AiOcrClient._extract_batch_events
+        calls = []
+        warnings = []
+        try:
+            os.environ["AI_OCR_ENABLED"] = "true"
+            os.environ["AI_OCR_IMAGE_BATCH_SIZE"] = "1"
+            os.environ["AI_OCR_IMAGE_WORKERS"] = "1"
+            os.environ["AI_OCR_DUAL_PROVIDER"] = "true"
+            os.environ["AI_OCR_PROVIDER_FALLBACK"] = "true"
+            os.environ["AI_OCR_PROVIDER_1_NAME"] = "siliconflow"
+            os.environ["AI_OCR_PROVIDER_1_API_KEY"] = "sf-key"
+            os.environ["AI_OCR_PROVIDER_1_BASE_URL"] = "https://api.example.com/v1"
+            os.environ["AI_OCR_PROVIDER_1_MODEL"] = "sf-vl"
+            os.environ["AI_OCR_PROVIDER_2_NAME"] = "zhipu"
+            os.environ["AI_OCR_PROVIDER_2_API_KEY"] = "zp-key"
+            os.environ["AI_OCR_PROVIDER_2_BASE_URL"] = "https://api.example.com/v1"
+            os.environ["AI_OCR_PROVIDER_2_MODEL"] = "zp-vl"
+
+            def fake_extract_batch(self, batch):
+                calls.append(self.provider.name)
+                if self.provider.name == "siliconflow":
+                    return [EventRow(date_text="9.12", performer="Molly Nillson", venue="\u74e6\u8086")]
+                return [
+                    EventRow(date_text="9.12", performer="Molly Nillson", venue="\u74e6\u8086"),
+                    EventRow(date_text="9.12", performer="VoX LoW", venue="\u661f\u5728"),
+                    EventRow(date_text="9.12", performer="Dabeull", venue=""),
+                ]
+
+            ai_ocr.AiOcrClient._extract_batch_events = fake_extract_batch
+            events = ai_ocr.extract_events_with_ai_ocr([Path("schedule.jpg")], warnings)
+        finally:
+            ai_ocr.AiOcrClient._extract_batch_events = original_extract
+            self._restore_env(old_values)
+
+        self.assertEqual(calls, ["siliconflow", "zhipu"])
+        self.assertEqual(
+            [(event.date_text, event.performer, event.venue) for event in events],
+            [
+                ("9.12", "Molly Nillson", "\u74e6\u8086"),
+                ("9.12", "VoX LoW", "\u661f\u5728"),
+                ("9.12", "Dabeull", ""),
+            ],
+        )
+
+    def test_extract_events_with_ai_ocr_rejects_low_row_batch_when_backup_fails(self):
+        old_values = self._clear_ai_ocr_env()
+        original_extract = ai_ocr.AiOcrClient._extract_batch_events
+        warnings = []
+        try:
+            os.environ["AI_OCR_ENABLED"] = "true"
+            os.environ["AI_OCR_IMAGE_BATCH_SIZE"] = "1"
+            os.environ["AI_OCR_IMAGE_WORKERS"] = "1"
+            os.environ["AI_OCR_DUAL_PROVIDER"] = "true"
+            os.environ["AI_OCR_PROVIDER_FALLBACK"] = "true"
+            os.environ["AI_OCR_PROVIDER_1_NAME"] = "siliconflow"
+            os.environ["AI_OCR_PROVIDER_1_API_KEY"] = "sf-key"
+            os.environ["AI_OCR_PROVIDER_1_BASE_URL"] = "https://api.example.com/v1"
+            os.environ["AI_OCR_PROVIDER_1_MODEL"] = "sf-vl"
+            os.environ["AI_OCR_PROVIDER_2_NAME"] = "zhipu"
+            os.environ["AI_OCR_PROVIDER_2_API_KEY"] = "zp-key"
+            os.environ["AI_OCR_PROVIDER_2_BASE_URL"] = "https://api.example.com/v1"
+            os.environ["AI_OCR_PROVIDER_2_MODEL"] = "zp-vl"
+
+            def fake_extract_batch(self, batch):
+                if self.provider.name == "siliconflow":
+                    return [EventRow(date_text="9.12", performer="Molly Nillson", venue="\u74e6\u8086")]
+                raise TimeoutError("timed out")
+
+            ai_ocr.AiOcrClient._extract_batch_events = fake_extract_batch
+            with self.assertRaisesRegex(RuntimeError, "1/1"):
+                ai_ocr.extract_events_with_ai_ocr([Path("schedule.jpg")], warnings)
+        finally:
+            ai_ocr.AiOcrClient._extract_batch_events = original_extract
+            self._restore_env(old_values)
+
 
 if __name__ == "__main__":
     unittest.main()

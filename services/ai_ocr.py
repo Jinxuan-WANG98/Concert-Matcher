@@ -53,6 +53,7 @@ class AiOcrConfig:
     provider_fallback: bool = False
     dual_provider: bool = False
     jpeg_quality: int = 85
+    low_result_threshold: int = 3
 
     @classmethod
     def from_env(cls) -> "AiOcrConfig":
@@ -83,6 +84,7 @@ class AiOcrConfig:
             provider_fallback=provider_fallback,
             dual_provider=dual_provider,
             jpeg_quality=max(60, min(95, int(os.environ.get("AI_OCR_JPEG_QUALITY", "88")))),
+            low_result_threshold=max(1, int(os.environ.get("AI_OCR_LOW_RESULT_THRESHOLD", "3"))),
         )
 
     @property
@@ -90,8 +92,8 @@ class AiOcrConfig:
         provider_source = "|".join(f"{provider.name}:{provider.model}:{provider.base_url}" for provider in self.providers)
         mode = "dual" if self.dual_provider else "single"
         return (
-            f"ai-ocr:v5-{mode}:{provider_source}:w{self.max_width}:"
-            f"batch{self.image_batch_size}"
+            f"ai-ocr:v6-{mode}:{provider_source}:w{self.max_width}:"
+            f"batch{self.image_batch_size}:low{self.low_result_threshold}"
         )
 
     @property
@@ -523,6 +525,17 @@ def _provider_order(providers: tuple[AiOcrProviderConfig, ...], start_index: int
     return ordered[offset:] + ordered[:offset]
 
 
+def _event_keys(events: list[EventRow]) -> set[tuple[str, str]]:
+    return {_event_key(event) for event in events if _event_key(event)[1]}
+
+
+def _low_result_attempts_agree(results: list[AiOcrProviderResult]) -> bool:
+    if len(results) < 2:
+        return False
+    reference = _event_keys(results[0].events)
+    return bool(reference) and all(_event_keys(result.events) == reference for result in results[1:])
+
+
 def _extract_batch_with_provider_fallback(
     batch: list[Path],
     providers: tuple[AiOcrProviderConfig, ...],
@@ -530,6 +543,7 @@ def _extract_batch_with_provider_fallback(
     config: AiOcrConfig,
 ) -> AiOcrProviderResult:
     errors: list[str] = []
+    low_results: list[AiOcrProviderResult] = []
     provider_list = _provider_order(providers, start_index)
     if not config.provider_fallback:
         provider_list = provider_list[:1]
@@ -548,7 +562,47 @@ def _extract_batch_with_provider_fallback(
         except Exception as exc:
             errors.append(f"{provider.name}: {describe_ai_exception(exc)}")
             continue
-        return AiOcrProviderResult(provider_name=provider.name, events=events)
+
+        if not events:
+            errors.append(f"{provider.name}: returned no usable rows")
+            continue
+
+        result = AiOcrProviderResult(provider_name=provider.name, events=events)
+        if len(events) >= config.low_result_threshold:
+            if low_results:
+                combined = _merge_event_lists([item.events for item in [*low_results, result]])
+                return AiOcrProviderResult(
+                    provider_name="+".join(item.provider_name for item in [*low_results, result]),
+                    events=combined,
+                )
+            return result
+
+        if not config.provider_fallback:
+            return result
+
+        low_results.append(result)
+        debug_log(
+            "ai_ocr.py:_extract_batch_with_provider_fallback",
+            "rechecking low-row ocr batch with next provider",
+            {
+                "provider": provider.name,
+                "eventCount": len(events),
+                "threshold": config.low_result_threshold,
+                "imageNames": [image_path.name for image_path in batch],
+            },
+            hypothesis_id="H3",
+        )
+
+        if _low_result_attempts_agree(low_results):
+            return AiOcrProviderResult(
+                provider_name="+".join(item.provider_name for item in low_results),
+                events=_merge_event_lists([item.events for item in low_results]),
+            )
+
+    if low_results:
+        errors.append(
+            f"low-row result below {config.low_result_threshold} rows could not be independently confirmed"
+        )
     return AiOcrProviderResult(
         provider_name=",".join(provider.name for provider in providers),
         events=[],
