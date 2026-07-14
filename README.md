@@ -72,7 +72,7 @@ Only one job runs per instance. Finished state and output files expire after `JO
 
 The app can also use vision models before local OCR. This is useful for Xiaohongshu notes whose first page and later pages use different layouts. Configure these values on the server, or copy `.env.example` to `.env` for local runs. Do not put real keys in frontend code.
 
-When two providers are configured with `AI_OCR_DUAL_PROVIDER=true`, the app rotates image batches across them in parallel (for example batch 1 to SiliconFlow, batch 2 to Zhipu), repairs malformed AI JSON with AI, merges rows by date and performer, and only uses local RapidOCR when `AI_OCR_LOCAL_FALLBACK=true`. It does not require both models to agree on the same image.
+When two providers are configured with `AI_OCR_DUAL_PROVIDER=true`, the app rotates image batches across them in parallel (for example batch 1 to SiliconFlow, batch 2 to Zhipu), repairs malformed AI JSON with AI, merges rows by date and performer, and only uses local RapidOCR when `AI_OCR_LOCAL_FALLBACK=true`. With `AI_OCR_PROVIDER_FALLBACK=true`, only a failed image batch is retried once by the alternate provider. It does not require both models to agree on the same image.
 
 ```text
 AI_OCR_ENABLED=true
@@ -88,7 +88,7 @@ AI_OCR_PROVIDER_2_MODEL=glm-4.6v
 AI_OCR_IMAGE_BATCH_SIZE=1
 AI_OCR_IMAGE_WORKERS=3
 AI_OCR_DUAL_PROVIDER=true
-AI_OCR_PROVIDER_FALLBACK=false
+AI_OCR_PROVIDER_FALLBACK=true
 AI_OCR_LOCAL_FALLBACK=false
 ```
 

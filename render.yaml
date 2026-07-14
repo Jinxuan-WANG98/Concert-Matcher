@@ -79,7 +79,7 @@ services:
       - key: AI_OCR_DUAL_PROVIDER
         value: "true"
       - key: AI_OCR_PROVIDER_FALLBACK
-        value: "false"
+        value: "true"
       - key: AI_OCR_TIMEOUT_SECONDS
         value: "90"
       - key: AI_OCR_LOCAL_FALLBACK
