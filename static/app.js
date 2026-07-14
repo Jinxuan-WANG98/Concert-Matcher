@@ -8,14 +8,21 @@ const resultSummary = document.querySelector("#result-summary");
 const warningsBox = document.querySelector("#warnings");
 const downloadLink = document.querySelector("#download-link");
 
+const jobStorageKey = "concertMatchJobId";
+const pollIntervalMs = 5000;
+let activeJobId = null;
+let pollTimer = null;
+let pollInFlight = false;
+
 const copy = {
-  loading: "\u6b63\u5728\u5e2e\u4f60\u8bfb\u53d6\u6b4c\u5355\u3001\u8bc6\u522b\u56fe\u7247\u548c\u5339\u914d\u6b4c\u624b\uff0c\u8bf7\u7a0d\u7b49\u3002",
-  matching: "\u5339\u914d\u4e2d",
-  start: "\u5f00\u59cb\u5339\u914d",
-  failed: "\u5339\u914d\u5931\u8d25\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5\u3002",
-  networkFailed: "\u8fde\u63a5\u4e2d\u65ad\uff1a\u672c\u5730\u670d\u52a1\u53ef\u80fd\u521a\u91cd\u542f\uff0c\u6216\u8bf7\u6c42\u65f6\u95f4\u592a\u957f\u88ab\u6d4f\u89c8\u5668\u4e2d\u65ad\u3002\u8bf7\u5237\u65b0\u9875\u9762\u540e\u91cd\u8bd5\u3002",
-  empty: "\u6682\u65f6\u6ca1\u6709\u5339\u914d\u5230\u8fd1\u671f\u6f14\u51fa\u3002\u53ef\u4ee5\u6362\u4e00\u4e2a\u6f14\u51fa\u6574\u7406\u94fe\u63a5\uff0c\u6216\u4e0a\u4f20\u66f4\u6e05\u6670\u7684\u56fe\u7247\u3002",
-  fileMode: "\u4f60\u73b0\u5728\u662f\u76f4\u63a5\u6253\u5f00 HTML \u6587\u4ef6\uff0c\u8fd9\u6837\u53ea\u80fd\u770b UI\uff0c\u4e0d\u80fd\u8fdb\u884c\u5339\u914d\u3002\u8bf7\u5148\u542f\u52a8 Web App\uff0c\u7136\u540e\u6253\u5f00 http://127.0.0.1:5050/ \u3002",
+  loading: "正在提交任务，请稍等。",
+  matching: "匹配中",
+  busy: "已有匹配任务在进行中。请保持页面打开，完成后会一次性显示最终结果。",
+  start: "开始匹配",
+  failed: "匹配失败，请稍后再试。",
+  networkFailed: "状态查询暂时中断，正在自动重试；任务 ID 已保留，请勿重复提交。",
+  empty: "暂时没有匹配到近期演出。可以换一个演出整理链接，或上传更清晰的图片。",
+  fileMode: "你现在是直接打开 HTML 文件，这样只能看 UI，不能进行匹配。请先启动 Web App，然后打开 http://127.0.0.1:5050/ 。",
 };
 
 if (window.location.protocol === "file:") {
@@ -52,9 +59,9 @@ function appendCell(row, value) {
 
 function confidenceClass(value) {
   const text = String(value || "").trim();
-  if (text === "\u9ad8") return "confidence confidence-high";
-  if (text === "\u4e2d") return "confidence confidence-medium";
-  if (text === "\u4f4e") return "confidence confidence-low";
+  if (text === "高") return "confidence confidence-high";
+  if (text === "中") return "confidence confidence-medium";
+  if (text === "低") return "confidence confidence-low";
   return "confidence";
 }
 
@@ -82,7 +89,7 @@ function renderResults(data) {
       appendCell(row, match.artist);
       appendCell(row, match.venue || "");
       appendCell(row, match.playlist_song_count);
-      appendCell(row, (match.sample_songs || []).join("\uff1b"));
+      appendCell(row, (match.sample_songs || []).join("；"));
 
       const confidenceCell = document.createElement("td");
       const confidence = document.createElement("span");
@@ -113,12 +120,133 @@ async function parseJsonResponse(response) {
   }
 }
 
-function displayErrorMessage(error) {
+function displayErrorMessage(error, response) {
   const message = error && error.message ? error.message : "";
+  if (response && response.status === 409) {
+    return message || copy.busy;
+  }
   if (message === "Failed to fetch" || message.includes("NetworkError")) {
     return copy.networkFailed;
   }
   return message || copy.failed;
+}
+
+function setSubmitting(isSubmitting) {
+  button.disabled = isSubmitting;
+  button.textContent = isSubmitting ? copy.matching : copy.start;
+}
+
+function rememberJob(jobId) {
+  activeJobId = jobId;
+  try {
+    localStorage.setItem(jobStorageKey, jobId);
+  } catch (error) {
+    // Private browsing can reject storage; in-memory polling still works.
+  }
+}
+
+function clearActiveJob() {
+  activeJobId = null;
+  if (pollTimer) {
+    window.clearTimeout(pollTimer);
+    pollTimer = null;
+  }
+  try {
+    localStorage.removeItem(jobStorageKey);
+  } catch (error) {
+    // Ignore unavailable browser storage.
+  }
+}
+
+function failActiveJob(message) {
+  showStatus(message || copy.failed, true);
+  clearActiveJob();
+  setSubmitting(false);
+}
+
+function scheduleJobPoll(jobId, delay = pollIntervalMs) {
+  if (pollTimer) {
+    window.clearTimeout(pollTimer);
+  }
+  pollTimer = window.setTimeout(() => pollJob(jobId), delay);
+}
+
+function progressMessage(data) {
+  const message = data.message || copy.busy;
+  const progress = Number.isFinite(data.progress) ? `（${data.progress}%）` : "";
+  return `${message}${progress}`;
+}
+
+async function pollJob(jobId) {
+  if (!jobId || activeJobId !== jobId) return;
+  if (pollInFlight) {
+    scheduleJobPoll(jobId);
+    return;
+  }
+
+  pollInFlight = true;
+  let shouldContinue = false;
+  try {
+    const response = await fetch(`/api/jobs/${jobId}`, { cache: "no-store" });
+    const data = await parseJsonResponse(response);
+    if (!response.ok) {
+      if (response.status === 404) {
+        clearActiveJob();
+        setSubmitting(false);
+      }
+      throw new Error(data.error || copy.failed);
+    }
+
+    if (data.state === "succeeded") {
+      if (!data.result) {
+        failActiveJob("任务已完成，但服务器没有返回最终结果。请重新提交。");
+        return;
+      }
+      renderResults(data.result);
+      hideStatus();
+      clearActiveJob();
+      setSubmitting(false);
+      return;
+    }
+
+    if (data.state === "failed") {
+      failActiveJob(data.error || copy.failed);
+      return;
+    }
+
+    showStatus(progressMessage(data));
+    setSubmitting(true);
+    shouldContinue = true;
+  } catch (error) {
+    showStatus(displayErrorMessage(error), true);
+    if (activeJobId === jobId) {
+      setSubmitting(true);
+      shouldContinue = true;
+    }
+  } finally {
+    pollInFlight = false;
+    if (shouldContinue && activeJobId === jobId) {
+      scheduleJobPoll(jobId);
+    }
+  }
+}
+
+async function resumeStoredJob() {
+  if (window.location.protocol === "file:") return;
+
+  let storedJobId = null;
+  try {
+    storedJobId = localStorage.getItem(jobStorageKey);
+  } catch (error) {
+    storedJobId = null;
+  }
+  if (storedJobId) {
+    rememberJob(storedJobId);
+    setSubmitting(true);
+    await pollJob(storedJobId);
+    return;
+  }
+  setSubmitting(false);
 }
 
 form.addEventListener("submit", async (event) => {
@@ -127,13 +255,18 @@ form.addEventListener("submit", async (event) => {
     showStatus(copy.fileMode, true);
     return;
   }
+  if (activeJobId) {
+    showStatus(copy.busy);
+    return;
+  }
+
   resultPanel.classList.add("hidden");
   showStatus(copy.loading);
-  button.disabled = true;
-  button.textContent = copy.matching;
+  setSubmitting(true);
 
+  let response;
   try {
-    const response = await fetch("/api/match", {
+    response = await fetch("/api/match", {
       method: "POST",
       body: new FormData(form),
     });
@@ -141,12 +274,19 @@ form.addEventListener("submit", async (event) => {
     if (!response.ok) {
       throw new Error(data.error || copy.failed);
     }
-    hideStatus();
-    renderResults(data);
+    if (!data.job_id) {
+      throw new Error("服务器没有返回任务 ID，请稍后重试。");
+    }
+
+    rememberJob(data.job_id);
+    showStatus(copy.busy);
+    await pollJob(data.job_id);
   } catch (error) {
-    showStatus(displayErrorMessage(error), true);
-  } finally {
-    button.disabled = false;
-    button.textContent = copy.start;
+    showStatus(displayErrorMessage(error, response), true);
+    if (!activeJobId) {
+      setSubmitting(false);
+    }
   }
 });
+
+resumeStoredJob();

@@ -16,6 +16,7 @@ from services.ai_matcher import (
     parse_ai_decision,
     parse_ai_match_suggestion,
     AiArtistReviewer,
+    _merge_suggestions,
 )
 from services.models import EventRow, PlaylistArtist
 
@@ -64,7 +65,41 @@ class AiMatcherTest(unittest.TestCase):
             model="text-model",
         )
 
-        self.assertTrue(config.cache_source.startswith("ai-match:v6:"))
+        self.assertTrue(config.cache_source.startswith("ai-match:v7:"))
+
+    def test_config_defaults_bound_calls_and_use_two_workers(self):
+        config = AiMatchConfig()
+
+        self.assertEqual(config.candidate_limit, 1000)
+        self.assertEqual(config.event_batch_size, 40)
+        self.assertEqual(config.event_workers, 2)
+        self.assertEqual(config.max_calls, 20)
+        self.assertEqual(config.max_elapsed_seconds, 600)
+
+    def test_config_loads_call_and_elapsed_budgets(self):
+        names = [
+            "AI_MATCH_API_KEY",
+            "AI_MATCH_ENABLED",
+            "AI_MATCH_MAX_CALLS",
+            "AI_MATCH_MAX_ELAPSED_SECONDS",
+        ]
+        old_values = {name: os.environ.pop(name, None) for name in names}
+        try:
+            os.environ["AI_MATCH_ENABLED"] = "true"
+            os.environ["AI_MATCH_API_KEY"] = "test-key"
+            os.environ["AI_MATCH_MAX_CALLS"] = "9"
+            os.environ["AI_MATCH_MAX_ELAPSED_SECONDS"] = "240"
+
+            config = AiMatchConfig.from_env()
+        finally:
+            for name, value in old_values.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+        self.assertEqual(config.max_calls, 9)
+        self.assertEqual(config.max_elapsed_seconds, 240)
 
     def test_config_loads_event_batch_size(self):
         old_values = {
@@ -293,15 +328,16 @@ class AiMatcherTest(unittest.TestCase):
         self.assertEqual(suggestions[1].artist_name, "PREP")
         self.assertEqual(suggestions[2].artist_name, "Hanser")
 
-    def test_reviewer_matches_large_event_set_by_parallel_candidate_groups(self):
+    def test_reviewer_sends_all_compact_candidates_once_per_large_event_batch(self):
         config = AiMatchConfig(
             enabled=True,
             api_key="test-key",
             base_url="https://api.example.com/v1",
             model="text-model",
-            candidate_limit=2,
+            candidate_limit=1000,
             event_batch_size=2,
             event_workers=1,
+            max_calls=30,
         )
         reviewer = AiArtistReviewer(config)
         calls = []
@@ -323,15 +359,132 @@ class AiMatcherTest(unittest.TestCase):
 
         suggestions = reviewer.find_best_matches(events, artists)
 
-        # 51 events / batch 2 => 26 event batches; 5 artists / limit 2 => 3 candidate batches
-        self.assertEqual(len(calls), 78)
+        # 51 events / batch 2 => 26 calls; all five compact candidates fit every call.
+        self.assertEqual(len(calls), 26)
         self.assertTrue(all(len(item["events"]) <= 2 for item in calls))
         self.assertEqual(
             calls[0]["playlist_candidates"],
-            [{"name": "Artist 0"}, {"name": "Artist 1"}],
+            [
+                {"name": "Artist 0"},
+                {"name": "Artist 1"},
+                {"name": "Artist 2"},
+                {"name": "Artist 3"},
+                {"name": "Artist 4"},
+            ],
         )
         self.assertEqual([item["event_index"] for item in calls[0]["events"]], [0, 1])
         self.assertEqual(suggestions[4].artist_name, "Artist 4")
+
+    def test_reviewer_uses_compact_candidates_for_normal_event_batches(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+            candidate_limit=1000,
+            event_batch_size=40,
+            event_workers=1,
+        )
+        reviewer = AiArtistReviewer(config)
+        payloads = []
+
+        def fake_chat(payload):
+            content = payload["messages"][-1]["content"]
+            payloads.append(json.loads(content.split("JSON:\n", 1)[1]))
+            return '{"matches":[]}'
+
+        reviewer._chat_content = fake_chat
+        reviewer.find_best_matches(
+            [EventRow(date_text="8.27", performer="PREP", venue="MAO")],
+            [PlaylistArtist(name="PREP", song_count=20, sample_songs=["Cheapest Flight"])],
+        )
+
+        self.assertEqual(payloads[0]["playlist_candidates"], [{"name": "PREP"}])
+
+    def test_call_budget_stops_recursive_timeout_splits(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+            candidate_limit=4,
+            event_batch_size=1,
+            event_workers=1,
+            max_calls=2,
+            max_elapsed_seconds=600,
+        )
+        reviewer = AiArtistReviewer(config)
+        calls = []
+
+        def always_timeout(payload):
+            calls.append(payload)
+            raise TimeoutError("The read operation timed out")
+
+        reviewer._chat_content = always_timeout
+        events = [EventRow(date_text="8.27", performer="Late Artist", venue="MAO")]
+        artists = [
+            PlaylistArtist(name=f"Artist {index}", song_count=1, sample_songs=[])
+            for index in range(4)
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "调用次数上限"):
+            reviewer.find_best_matches(events, artists)
+
+        self.assertEqual(len(calls), 2)
+
+    def test_terminal_single_event_single_artist_timeout_is_not_treated_as_no_match(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+            candidate_limit=1,
+            event_batch_size=1,
+            event_workers=1,
+        )
+        reviewer = AiArtistReviewer(config)
+        reviewer._chat_content = lambda payload: (_ for _ in ()).throw(
+            TimeoutError("The read operation timed out")
+        )
+
+        with self.assertRaisesRegex(TimeoutError, "timed out"):
+            reviewer.find_best_matches(
+                [EventRow(date_text="8.27", performer="PREP", venue="MAO")],
+                [PlaylistArtist(name="PREP", song_count=1, sample_songs=[])],
+            )
+
+    def test_elapsed_budget_stops_before_provider_call(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+            event_batch_size=1,
+            event_workers=1,
+            max_calls=20,
+            max_elapsed_seconds=0,
+        )
+        reviewer = AiArtistReviewer(config)
+        calls = []
+        reviewer._chat_content = lambda payload: calls.append(payload) or '{"matches":[]}'
+
+        with self.assertRaisesRegex(RuntimeError, "总时限"):
+            reviewer.find_best_matches(
+                [EventRow(date_text="8.27", performer="PREP", venue="MAO")],
+                [PlaylistArtist(name="PREP", song_count=1, sample_songs=[])],
+            )
+
+        self.assertEqual(calls, [])
+
+    def test_equal_confidence_merge_is_deterministic(self):
+        alpha = {0: AiMatchSuggestion(artist_name="Alpha", confidence="高", reason="first")}
+        zeta = {0: AiMatchSuggestion(artist_name="Zeta", confidence="高", reason="second")}
+
+        forward = _merge_suggestions(alpha, zeta)
+        reverse = _merge_suggestions(zeta, alpha)
+
+        self.assertEqual(forward, reverse)
+        self.assertEqual(forward[0].artist_name, "Alpha")
 
     def test_reviewer_runs_event_batches_in_parallel(self):
         config = AiMatchConfig(

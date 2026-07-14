@@ -21,6 +21,10 @@ from services.models import EventRow
 from services.ocr import clean_ocr_text
 
 
+class AiOcrIncompleteError(RuntimeError):
+    """Raised when at least one required image batch has no AI result."""
+
+
 @dataclass(frozen=True)
 class AiOcrProviderConfig:
     name: str
@@ -580,6 +584,7 @@ def extract_events_with_ai_ocr(image_paths: list[Path], warnings: list[str]) -> 
         )
 
         results_by_batch: dict[int, AiOcrProviderResult] = {}
+        failed_batches: list[int] = []
         batches = list(_chunked(image_paths, config.image_batch_size))
         worker_count = min(max(1, config.image_workers), len(batches))
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
@@ -601,6 +606,7 @@ def extract_events_with_ai_ocr(image_paths: list[Path], warnings: list[str]) -> 
                     error = describe_ai_exception(exc)
                     result = AiOcrProviderResult(provider_name="batch", events=[], error=error)
                 if result.error:
+                    failed_batches.append(batch_index)
                     warnings.append(f"AI \u8bc6\u522b\u5931\u8d25\uff08{result.provider_name}\uff09\uff1a{result.error}")
                     debug_log(
                         "ai_ocr.py:extract_events_with_ai_ocr",
@@ -622,9 +628,15 @@ def extract_events_with_ai_ocr(image_paths: list[Path], warnings: list[str]) -> 
                 )
 
         results = [results_by_batch[index] for index in sorted(results_by_batch)]
+        timer.data["successfulBatches"] = len(results)
+        timer.data["failedBatches"] = len(failed_batches)
+        if failed_batches:
+            raise AiOcrIncompleteError(
+                f"AI 图片识别未完整完成：{len(failed_batches)}/{len(batches)} 个图片批次失败，"
+                "为避免返回部分结果，本次任务已停止，请重试。"
+            )
         events = select_ai_ocr_events(results)
         timer.data["mergedEventCount"] = len(events)
-        timer.data["successfulBatches"] = len(results)
         if not events:
             warnings.append("AI \u8bc6\u522b\u672a\u8fd4\u56de\u53ef\u7528\u884c\uff0c\u672a\u81ea\u52a8\u8c03\u7528\u672c\u5730 OCR\u3002")
             return []

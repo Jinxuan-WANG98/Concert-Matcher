@@ -11,7 +11,15 @@ services:
       - key: WEB_CONCURRENCY
         value: "1"
       - key: MAX_UPLOAD_MB
-        value: "80"
+        value: "30"
+      - key: MAX_IMAGE_FILE_MB
+        value: "12"
+      - key: MAX_IMAGE_PIXELS
+        value: "12000000"
+      - key: MAX_IMAGE_DIMENSION
+        value: "12000"
+      - key: JOB_TTL_SECONDS
+        value: "86400"
       - key: OUTPUT_ROOT
         value: outputs/webapp
       - key: OCR_MAX_WORKERS
@@ -21,7 +29,7 @@ services:
       - key: NETEASE_MAX_WORKERS
         value: "2"
       - key: PIPELINE_PARALLEL_LOAD
-        value: "true"
+        value: "false"
       - key: AI_MATCH_ENABLED
         value: "true"
       - key: AI_MATCH_BASE_URL
@@ -33,11 +41,15 @@ services:
       - key: AI_MATCH_TIMEOUT_SECONDS
         value: "60"
       - key: AI_MATCH_CANDIDATE_LIMIT
-        value: "120"
+        value: "1000"
       - key: AI_MATCH_EVENT_BATCH_SIZE
-        value: "15"
+        value: "40"
       - key: AI_MATCH_EVENT_WORKERS
         value: "2"
+      - key: AI_MATCH_MAX_CALLS
+        value: "20"
+      - key: AI_MATCH_MAX_ELAPSED_SECONDS
+        value: "600"
       - key: AI_OCR_ENABLED
         value: "true"
       - key: AI_OCR_PROVIDER_1_NAME
@@ -59,7 +71,7 @@ services:
       - key: AI_OCR_IMAGE_BATCH_SIZE
         value: "1"
       - key: AI_OCR_IMAGE_WORKERS
-        value: "2"
+        value: "3"
       - key: AI_OCR_IMAGE_DETAIL
         value: auto
       - key: AI_OCR_MAX_WIDTH

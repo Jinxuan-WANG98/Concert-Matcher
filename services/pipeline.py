@@ -3,14 +3,14 @@ from __future__ import annotations
 import os
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Callable
 from urllib.error import HTTPError
 
 from PIL import Image
 
 from services.ai_errors import describe_ai_exception
-from services.ai_ocr import AiOcrConfig, extract_events_with_ai_ocr
+from services.ai_ocr import AiOcrConfig, AiOcrIncompleteError, extract_events_with_ai_ocr
 from services.ai_matcher import AiArtistReviewer, AiMatchConfig
 from services.debug_timing import PhaseTimer, debug_log, get_phase_timings, reset_phase_timings
 from services.export_excel import write_matches_xlsx
@@ -52,10 +52,11 @@ def _load_playlist_artists(netease_url: str) -> list[PlaylistArtist]:
 
 
 class _SafeAiReviewer:
-    def __init__(self, reviewer, warnings: list[str]):
+    def __init__(self, reviewer, warnings: list[str], strict: bool = False):
         self._reviewer = reviewer
         self._warnings = warnings
         self._warning_recorded = False
+        self._strict = strict
 
     def _warn_once(self, exc: Exception) -> None:
         if self._warning_recorded:
@@ -67,6 +68,8 @@ class _SafeAiReviewer:
         try:
             return self._reviewer.review(event, artist)
         except Exception as exc:
+            if self._strict:
+                raise
             self._warn_once(exc)
             return None
 
@@ -76,6 +79,8 @@ class _SafeAiReviewer:
         try:
             return self._reviewer.find_best_match(event, artists)
         except Exception as exc:
+            if self._strict:
+                raise
             self._warn_once(exc)
             return None
 
@@ -86,9 +91,13 @@ class _SafeAiReviewer:
             suggestions = self._reviewer.find_best_matches(events, artists)
             failures = getattr(self._reviewer, "last_failures", [])
             if failures:
+                if self._strict:
+                    raise failures[0]
                 self._warn_once(failures[0])
             return suggestions
         except Exception as exc:
+            if self._strict:
+                raise
             self._warn_once(exc)
             return {}
 
@@ -229,8 +238,17 @@ def _load_events_for_xhs(
     return events
 
 
-def _parallel_pipeline_enabled() -> bool:
-    return os.environ.get("PIPELINE_PARALLEL_LOAD", "true").lower() in {"1", "true", "yes", "on"}
+ProgressCallback = Callable[[str, int, str], None]
+
+
+def _report_progress(
+    callback: ProgressCallback | None,
+    stage: str,
+    progress: int,
+    message: str,
+) -> None:
+    if callback is not None:
+        callback(stage, progress, message)
 
 
 def _load_events_and_artists(
@@ -241,69 +259,41 @@ def _load_events_and_artists(
     job_dir: Path,
     output_root: Path,
     warnings: list[str],
+    progress_callback: ProgressCallback | None = None,
 ) -> tuple[list[PlaylistArtist], list[EventRow]]:
-    parallel_pipeline = _parallel_pipeline_enabled()
-
     def load_artists() -> list[PlaylistArtist]:
         with PhaseTimer("pipeline.py", "load_playlist_artists") as timer:
             artists = _load_playlist_artists(netease_url)
             timer.data["artistCount"] = len(artists)
             return artists
 
+    _report_progress(progress_callback, "playlist", 5, "\u6b63\u5728\u8bfb\u53d6\u7f51\u6613\u4e91\u6b4c\u5355")
+    artists = load_artists()
+    _report_progress(progress_callback, "ocr", 20, "\u6b63\u5728\u8bc6\u522b\u6f14\u51fa\u56fe\u7247")
+
     if image_paths:
-        if parallel_pipeline:
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                artists_future = executor.submit(load_artists)
-                events_future = executor.submit(
-                    _load_events_for_uploaded_images,
-                    image_paths,
-                    output_root,
-                    warnings,
-                )
-                artists = artists_future.result()
-                with PhaseTimer("pipeline.py", "load_uploaded_events") as timer:
-                    events = events_future.result()
-                    timer.data["eventCount"] = len(events)
-                    timer.data["imageCount"] = len(image_paths)
-        else:
-            artists = load_artists()
-            with PhaseTimer("pipeline.py", "load_uploaded_events") as timer:
-                events = _load_events_for_uploaded_images(image_paths, output_root, warnings)
-                timer.data["eventCount"] = len(events)
-                timer.data["imageCount"] = len(image_paths)
+        with PhaseTimer("pipeline.py", "load_uploaded_events") as timer:
+            events = _load_events_for_uploaded_images(image_paths, output_root, warnings)
+            timer.data["eventCount"] = len(events)
+            timer.data["imageCount"] = len(image_paths)
         return artists, events
 
     if xhs_url.strip():
-        if parallel_pipeline:
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                artists_future = executor.submit(load_artists)
-                events_future = executor.submit(_load_events_for_xhs, xhs_url, job_dir, output_root, warnings)
-                try:
-                    with PhaseTimer("pipeline.py", "load_xhs_events") as timer:
-                        events = events_future.result()
-                        timer.data["eventCount"] = len(events)
-                except Exception as exc:
-                    warnings.append(
-                        "\u5c0f\u7ea2\u4e66\u94fe\u63a5\u6293\u53d6\u5931\u8d25\uff1a"
-                        f"{exc}\u3002\u8bf7\u4e0a\u4f20\u56fe\u7247\u7ee7\u7eed\u8bc6\u522b\u3002"
-                    )
-                    events = []
-                artists = artists_future.result()
-        else:
-            try:
-                with PhaseTimer("pipeline.py", "load_xhs_events") as timer:
-                    events = _load_events_for_xhs(xhs_url, job_dir, output_root, warnings)
-                    timer.data["eventCount"] = len(events)
-            except Exception as exc:
-                warnings.append(
-                    "\u5c0f\u7ea2\u4e66\u94fe\u63a5\u6293\u53d6\u5931\u8d25\uff1a"
-                    f"{exc}\u3002\u8bf7\u4e0a\u4f20\u56fe\u7247\u7ee7\u7eed\u8bc6\u522b\u3002"
-                )
-                events = []
-            artists = load_artists()
+        try:
+            with PhaseTimer("pipeline.py", "load_xhs_events") as timer:
+                events = _load_events_for_xhs(xhs_url, job_dir, output_root, warnings)
+                timer.data["eventCount"] = len(events)
+        except AiOcrIncompleteError:
+            raise
+        except Exception as exc:
+            warnings.append(
+                "\u5c0f\u7ea2\u4e66\u94fe\u63a5\u6293\u53d6\u5931\u8d25\uff1a"
+                f"{exc}\u3002\u8bf7\u4e0a\u4f20\u56fe\u7247\u7ee7\u7eed\u8bc6\u522b\u3002"
+            )
+            events = []
         return artists, events
 
-    return load_artists(), []
+    return artists, []
 
 
 def run_match_pipeline(
@@ -312,10 +302,12 @@ def run_match_pipeline(
     uploaded_images: list[Path] | None = None,
     output_root: Path | None = None,
     use_ai: bool = False,
+    job_id: str | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> PipelineResult:
     warnings: list[str] = []
     output_root = output_root or Path("outputs/webapp")
-    job_dir = output_root / uuid.uuid4().hex
+    job_dir = output_root / (job_id or uuid.uuid4().hex)
     job_dir.mkdir(parents=True, exist_ok=True)
     pipeline_started = time.perf_counter()
     reset_phase_timings()
@@ -328,6 +320,7 @@ def run_match_pipeline(
         job_dir=job_dir,
         output_root=output_root,
         warnings=warnings,
+        progress_callback=progress_callback,
     )
 
     if not image_paths and not events and xhs_url.strip():
@@ -350,14 +343,19 @@ def run_match_pipeline(
     if use_ai:
         ai_config = AiMatchConfig.from_env()
         if ai_config.enabled:
-            ai_reviewer = _SafeAiReviewer(AiArtistReviewer(ai_config, output_root=output_root), warnings)
             ai_only = ai_config.mode == "ai_only"
+            ai_reviewer = _SafeAiReviewer(
+                AiArtistReviewer(ai_config, output_root=output_root),
+                warnings,
+                strict=ai_only,
+            )
         else:
             warnings.append(
                 "AI \u590d\u6838\u672a\u542f\u7528\uff1a"
                 "\u670d\u52a1\u5668\u6ca1\u6709\u914d\u7f6e AI API Key\uff0c"
                 "\u5df2\u4f7f\u7528\u672c\u5730\u5339\u914d\u3002"
             )
+    _report_progress(progress_callback, "ai_match", 65, "\u6b63\u5728\u8fdb\u884c AI \u6b4c\u624b\u5339\u914d")
     with PhaseTimer("pipeline.py", "ai_match") as match_timer:
         result = run_match_pipeline_from_data(artists, events, ai_reviewer=ai_reviewer, ai_only=ai_only)
         match_timer.data["matchCount"] = len(result.matches)
@@ -367,6 +365,7 @@ def run_match_pipeline(
         event_count=result.event_count,
         warnings=warnings,
     )
+    _report_progress(progress_callback, "export", 95, "\u6b63\u5728\u751f\u6210\u6700\u7ec8\u7ed3\u679c")
     with PhaseTimer("pipeline.py", "write_excel") as excel_timer:
         excel_path = write_matches_xlsx(result, job_dir / "matches.xlsx")
         excel_timer.data["hasExcel"] = excel_path is not None
@@ -375,7 +374,7 @@ def run_match_pipeline(
         "pipeline complete",
         {
             "elapsedMs": int((time.perf_counter() - pipeline_started) * 1000),
-            "parallelLoad": _parallel_pipeline_enabled(),
+            "parallelLoad": False,
             "eventCount": result.event_count,
             "matchCount": len(result.matches),
             "artistCount": result.playlist_artist_count,
@@ -392,7 +391,20 @@ def run_match_pipeline(
     )
 
 
-def save_uploaded_images(files, upload_dir: Path) -> list[Path]:
+def save_uploaded_images(
+    files,
+    upload_dir: Path,
+    *,
+    max_file_bytes: int | None = None,
+    max_pixels: int | None = None,
+    max_dimension: int | None = None,
+) -> list[Path]:
+    if max_file_bytes is None:
+        max_file_bytes = int(os.environ.get("MAX_IMAGE_FILE_MB", "12")) * 1024 * 1024
+    if max_pixels is None:
+        max_pixels = int(os.environ.get("MAX_IMAGE_PIXELS", "12000000"))
+    if max_dimension is None:
+        max_dimension = int(os.environ.get("MAX_IMAGE_DIMENSION", "12000"))
     upload_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     saved_count = 0
@@ -407,12 +419,21 @@ def save_uploaded_images(files, upload_dir: Path) -> list[Path]:
         path = upload_dir / f"upload_{saved_count:02d}{ext}"
         file.save(path)
         file_size = path.stat().st_size if path.exists() else -1
-        if file_size <= 0:
+        if file_size <= 0 or file_size > max_file_bytes:
             path.unlink(missing_ok=True)
             continue
         try:
             with Image.open(path) as img:
-                img.load()
+                width, height = img.size
+                if (
+                    width <= 0
+                    or height <= 0
+                    or width > max_dimension
+                    or height > max_dimension
+                    or width * height > max_pixels
+                ):
+                    raise ValueError("image dimensions exceed upload limits")
+                img.verify()
         except Exception:
             path.unlink(missing_ok=True)
             continue

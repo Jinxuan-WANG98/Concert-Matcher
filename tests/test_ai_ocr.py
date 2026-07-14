@@ -309,15 +309,43 @@ class AiOcrTest(unittest.TestCase):
 
             ai_ocr.AiOcrClient._extract_batch_events = forbidden_extract
 
-            events = ai_ocr.extract_events_with_ai_ocr([Path("note.jpg")], warnings)
+            with self.assertRaisesRegex(RuntimeError, "AI 图片识别未完整完成"):
+                ai_ocr.extract_events_with_ai_ocr([Path("note.jpg")], warnings)
         finally:
             ai_ocr.AiOcrClient._extract_batch_events = original_extract
             self._restore_env(old_values)
 
-        self.assertEqual(events, [])
         self.assertIn("AI \u8bc6\u522b\u5931\u8d25", " ".join(warnings))
         self.assertIn("403", " ".join(warnings))
         self.assertNotIn("HTTP Error 403: Forbidden", " ".join(warnings))
+
+    def test_extract_events_with_ai_ocr_rejects_partial_batch_success(self):
+        old_values = self._clear_ai_ocr_env()
+        original_extract_batch = ai_ocr._extract_batch_with_provider_fallback
+        warnings = []
+        try:
+            os.environ["AI_OCR_ENABLED"] = "true"
+            os.environ["AI_OCR_IMAGE_BATCH_SIZE"] = "1"
+            os.environ["AI_OCR_IMAGE_WORKERS"] = "2"
+            os.environ["AI_OCR_PROVIDER_1_NAME"] = "test"
+            os.environ["AI_OCR_PROVIDER_1_API_KEY"] = "test-key"
+            os.environ["AI_OCR_PROVIDER_1_BASE_URL"] = "https://api.example.com/v1"
+            os.environ["AI_OCR_PROVIDER_1_MODEL"] = "vision-model"
+
+            def fake_extract(batch, providers, batch_index, config):
+                if batch_index == 1:
+                    return AiOcrProviderResult(provider_name="test", events=[], error="timed out")
+                return AiOcrProviderResult(
+                    provider_name="test",
+                    events=[EventRow(date_text="7.11", performer="PREP", venue="MAO")],
+                )
+
+            ai_ocr._extract_batch_with_provider_fallback = fake_extract
+            with self.assertRaisesRegex(RuntimeError, "1/2"):
+                ai_ocr.extract_events_with_ai_ocr([Path("one.jpg"), Path("two.jpg")], warnings)
+        finally:
+            ai_ocr._extract_batch_with_provider_fallback = original_extract_batch
+            self._restore_env(old_values)
 
     def test_client_sends_multiple_images_in_one_request_when_batch_size_allows(self):
         original_urlopen = ai_ocr.request.urlopen

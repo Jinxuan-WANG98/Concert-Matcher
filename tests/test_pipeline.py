@@ -8,6 +8,7 @@ from urllib.error import HTTPError
 from openpyxl import load_workbook
 from werkzeug.datastructures import FileStorage
 
+from services.ai_matcher import AiMatchSuggestion
 from services.export_excel import write_matches_xlsx
 from services.models import EventRow, PlaylistArtist
 import services.pipeline as pipeline
@@ -15,6 +16,29 @@ from services.pipeline import run_match_pipeline, run_match_pipeline_from_data, 
 
 
 class PipelineTest(unittest.TestCase):
+    def test_xhs_pipeline_does_not_swallow_incomplete_ai_ocr(self):
+        original_playlist = pipeline._load_playlist_artists
+        original_xhs = pipeline._load_events_for_xhs
+        pipeline._load_playlist_artists = lambda url: [
+            PlaylistArtist(name="PREP", song_count=1, sample_songs=[])
+        ]
+
+        def incomplete_ocr(*args, **kwargs):
+            raise pipeline.AiOcrIncompleteError("one image batch failed")
+
+        pipeline._load_events_for_xhs = incomplete_ocr
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaisesRegex(RuntimeError, "one image batch failed"):
+                    run_match_pipeline(
+                        "https://music.163.com/#/playlist?id=1",
+                        "https://www.xiaohongshu.com/explore/1",
+                        output_root=Path(tmp),
+                    )
+        finally:
+            pipeline._load_playlist_artists = original_playlist
+            pipeline._load_events_for_xhs = original_xhs
+
     def test_safe_ai_reviewer_keeps_trying_after_one_single_match_failure(self):
         class FlakyReviewer:
             def __init__(self):
@@ -34,6 +58,30 @@ class PipelineTest(unittest.TestCase):
         self.assertIsNone(reviewer.find_best_match(event, artists))
         self.assertEqual(reviewer.find_best_match(event, artists), "second-result")
         self.assertEqual(len(warnings), 1)
+
+    def test_strict_safe_ai_reviewer_rejects_partial_batch_completion(self):
+        class PartialReviewer:
+            last_failures = [RuntimeError("one required batch failed")]
+
+            def find_best_matches(self, events, artists):
+                return {
+                    0: AiMatchSuggestion(
+                        artist_name="PREP",
+                        confidence="高",
+                        reason="first batch succeeded",
+                    )
+                }
+
+        warnings = []
+        reviewer = pipeline._SafeAiReviewer(PartialReviewer(), warnings, strict=True)
+
+        with self.assertRaisesRegex(RuntimeError, "one required batch failed"):
+            reviewer.find_best_matches(
+                [EventRow(date_text="8.27", performer="PREP", venue="MAO")],
+                [PlaylistArtist(name="PREP", song_count=1, sample_songs=[])],
+            )
+
+        self.assertEqual(warnings, [])
 
     def test_pipeline_matches_and_exports_required_columns(self):
         artists = [
@@ -257,6 +305,56 @@ class PipelineTest(unittest.TestCase):
         finally:
             pipeline.fetch_playlist_artists = original_fetch
 
+    def test_pipeline_validates_playlist_before_starting_uploaded_image_ocr(self):
+        original_fetch = pipeline.fetch_playlist_artists
+        original_events = pipeline._load_events_for_uploaded_images
+        ocr_started = []
+        pipeline.fetch_playlist_artists = lambda url: (_ for _ in ()).throw(
+            RuntimeError("playlist unavailable")
+        )
+        pipeline._load_events_for_uploaded_images = lambda *args, **kwargs: ocr_started.append(True) or []
+        try:
+            with self.assertRaisesRegex(RuntimeError, "playlist unavailable"):
+                run_match_pipeline(
+                    "https://music.163.com/#/playlist?id=1",
+                    "",
+                    uploaded_images=[Path(__file__)],
+                    output_root=Path(tempfile.gettempdir()) / "concert-matcher-test",
+                )
+        finally:
+            pipeline.fetch_playlist_artists = original_fetch
+            pipeline._load_events_for_uploaded_images = original_events
+
+        self.assertEqual(ocr_started, [])
+
+    def test_pipeline_uses_supplied_job_id_and_reports_stages(self):
+        original_fetch = pipeline.fetch_playlist_artists
+        original_events = pipeline._load_events_for_uploaded_images
+        pipeline.fetch_playlist_artists = lambda url: [
+            PlaylistArtist(name="PREP", song_count=1, sample_songs=[])
+        ]
+        pipeline._load_events_for_uploaded_images = lambda *args, **kwargs: [
+            EventRow(date_text="8.27", performer="PREP", venue="MAO")
+        ]
+        stages = []
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                result = run_match_pipeline(
+                    "https://music.163.com/#/playlist?id=1",
+                    "",
+                    uploaded_images=[Path(__file__)],
+                    output_root=Path(tmp),
+                    job_id="3" * 32,
+                    progress_callback=lambda stage, progress, message: stages.append((stage, progress)),
+                )
+                self.assertEqual(result.excel_path.parent.name, "3" * 32)
+        finally:
+            pipeline.fetch_playlist_artists = original_fetch
+            pipeline._load_events_for_uploaded_images = original_events
+
+        self.assertEqual([stage for stage, _ in stages], ["playlist", "ocr", "ai_match", "export"])
+        self.assertEqual(stages, sorted(stages, key=lambda item: item[1]))
+
     def test_pipeline_keeps_local_match_when_ai_review_is_forbidden(self):
         class ForbiddenReviewer:
             def __init__(self, config, output_root=None):
@@ -412,6 +510,52 @@ class PipelineTest(unittest.TestCase):
             upload_dir = Path(tmp)
             invalid = FileStorage(stream=io.BytesIO(b"not an image"), filename="bad.jpg", content_type="image/jpeg")
             paths = save_uploaded_images([invalid], upload_dir)
+            self.assertEqual(paths, [])
+            self.assertEqual(list(upload_dir.iterdir()), [])
+
+    def test_save_uploaded_images_rejects_oversized_individual_file(self):
+        from PIL import Image
+
+        image_bytes = io.BytesIO()
+        Image.new("RGB", (10, 10)).save(image_bytes, format="PNG")
+        with tempfile.TemporaryDirectory() as tmp:
+            upload_dir = Path(tmp)
+            upload = FileStorage(
+                stream=io.BytesIO(image_bytes.getvalue()),
+                filename="large.png",
+                content_type="image/png",
+            )
+
+            paths = save_uploaded_images(
+                [upload],
+                upload_dir,
+                max_file_bytes=len(image_bytes.getvalue()) - 1,
+            )
+
+            self.assertEqual(paths, [])
+            self.assertEqual(list(upload_dir.iterdir()), [])
+
+    def test_save_uploaded_images_rejects_excessive_pixels_or_dimension(self):
+        from PIL import Image
+
+        pixel_bytes = io.BytesIO()
+        Image.new("RGB", (400, 400)).save(pixel_bytes, format="PNG")
+        dimension_bytes = io.BytesIO()
+        Image.new("RGB", (401, 1)).save(dimension_bytes, format="PNG")
+        with tempfile.TemporaryDirectory() as tmp:
+            upload_dir = Path(tmp)
+            files = [
+                FileStorage(stream=io.BytesIO(pixel_bytes.getvalue()), filename="pixels.png"),
+                FileStorage(stream=io.BytesIO(dimension_bytes.getvalue()), filename="dimension.png"),
+            ]
+
+            paths = save_uploaded_images(
+                files,
+                upload_dir,
+                max_pixels=100_000,
+                max_dimension=400,
+            )
+
             self.assertEqual(paths, [])
             self.assertEqual(list(upload_dir.iterdir()), [])
 

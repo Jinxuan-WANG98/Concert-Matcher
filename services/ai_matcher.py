@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import hashlib
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -39,10 +40,12 @@ class AiMatchConfig:
     base_url: str = "https://api.openai.com/v1"
     model: str = "gpt-4.1-mini"
     timeout_seconds: int = 20
-    candidate_limit: int = 120
+    candidate_limit: int = 1000
     mode: str = "review"
-    event_batch_size: int = 30
-    event_workers: int = 3
+    event_batch_size: int = 40
+    event_workers: int = 2
+    max_calls: int = 20
+    max_elapsed_seconds: int = 600
 
     @classmethod
     def from_env(cls) -> "AiMatchConfig":
@@ -68,15 +71,17 @@ class AiMatchConfig:
             base_url=base_url.rstrip("/"),
             model=os.environ.get("AI_MATCH_MODEL", "gpt-4.1-mini"),
             timeout_seconds=int(os.environ.get("AI_MATCH_TIMEOUT_SECONDS", "20")),
-            candidate_limit=int(os.environ.get("AI_MATCH_CANDIDATE_LIMIT", "120")),
+            candidate_limit=max(1, int(os.environ.get("AI_MATCH_CANDIDATE_LIMIT", "1000"))),
             mode=mode,
-            event_batch_size=max(1, int(os.environ.get("AI_MATCH_EVENT_BATCH_SIZE", "30"))),
-            event_workers=max(1, int(os.environ.get("AI_MATCH_EVENT_WORKERS", "3"))),
+            event_batch_size=max(1, int(os.environ.get("AI_MATCH_EVENT_BATCH_SIZE", "40"))),
+            event_workers=max(1, int(os.environ.get("AI_MATCH_EVENT_WORKERS", "2"))),
+            max_calls=max(1, int(os.environ.get("AI_MATCH_MAX_CALLS", "20"))),
+            max_elapsed_seconds=max(1, int(os.environ.get("AI_MATCH_MAX_ELAPSED_SECONDS", "600"))),
         )
 
     @property
     def cache_source(self) -> str:
-        return f"ai-match:v6:{self.base_url}:{self.model}:c{self.candidate_limit}:mode{self.mode}"
+        return f"ai-match:v7:{self.base_url}:{self.model}:c{self.candidate_limit}:mode{self.mode}"
 
 
 def build_review_payload(event: EventRow, artist: PlaylistArtist, model: str = "gpt-4.1-mini") -> dict[str, Any]:
@@ -467,7 +472,17 @@ def _merge_suggestions(
     merged = dict(current)
     for index, suggestion in new.items():
         existing = merged.get(index)
-        if existing is None or _confidence_rank(suggestion.confidence) > _confidence_rank(existing.confidence):
+        new_rank = _confidence_rank(suggestion.confidence)
+        existing_rank = _confidence_rank(existing.confidence) if existing is not None else -1
+        deterministic_key = (suggestion.artist_name.casefold(), suggestion.reason.casefold())
+        existing_key = (
+            (existing.artist_name.casefold(), existing.reason.casefold())
+            if existing is not None
+            else ("", "")
+        )
+        if existing is None or new_rank > existing_rank or (
+            new_rank == existing_rank and deterministic_key < existing_key
+        ):
             merged[index] = suggestion
     return merged
 
@@ -477,6 +492,9 @@ class AiArtistReviewer:
         self.config = config or AiMatchConfig.from_env()
         self.output_root = output_root
         self.last_failures: list[Exception] = []
+        self._budget_lock = threading.Lock()
+        self._calls_used = 0
+        self._deadline: float | None = None
 
     def _chat_content(self, payload: dict[str, Any]) -> str:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -493,12 +511,23 @@ class AiArtistReviewer:
             result = json.loads(response.read().decode("utf-8"))
         return result["choices"][0]["message"]["content"]
 
+    def _guarded_chat_content(self, payload: dict[str, Any]) -> str:
+        with self._budget_lock:
+            if self._deadline is None:
+                self._deadline = time.monotonic() + self.config.max_elapsed_seconds
+            if time.monotonic() >= self._deadline:
+                raise RuntimeError("AI 匹配超过总时限，任务已停止，未返回不完整结果。")
+            if self._calls_used >= self.config.max_calls:
+                raise RuntimeError("AI 匹配达到调用次数上限，任务已停止，未返回不完整结果。")
+            self._calls_used += 1
+        return self._chat_content(payload)
+
     def _parse_with_ai_repair(self, raw_text: str, parser, schema: str):
         try:
             return parser(raw_text)
         except (json.JSONDecodeError, TypeError, ValueError):
             payload = build_ai_match_repair_payload(self.config.model, raw_text, schema)
-            return parser(self._chat_content(payload))
+            return parser(self._guarded_chat_content(payload))
 
     def review(self, event: EventRow, artist: PlaylistArtist) -> AiDecision | None:
         if not self.config.enabled:
@@ -506,7 +535,7 @@ class AiArtistReviewer:
 
         payload = build_review_payload(event, artist, model=self.config.model)
         return self._parse_with_ai_repair(
-            self._chat_content(payload),
+            self._guarded_chat_content(payload),
             parse_ai_decision,
             '{"is_match": boolean, "confidence": "高|中|低", "reason": string}',
         )
@@ -533,6 +562,9 @@ class AiArtistReviewer:
                 timer.data["cacheHit"] = True
                 timer.data["suggestionCount"] = len(cached)
                 return cached
+            with self._budget_lock:
+                self._calls_used = 0
+                self._deadline = time.monotonic() + self.config.max_elapsed_seconds
 
             if len(events) > LARGE_EVENT_SET_SINGLE_PASS_THRESHOLD:
                 suggestions = self._find_best_matches_for_candidate_groups(events, artists)
@@ -665,11 +697,21 @@ class AiArtistReviewer:
             for artist_batch in _chunked(artists, candidate_batch_size):
                 suggestions = _merge_suggestions(
                     suggestions,
-                    self._find_best_matches_batch_for_candidates(events, artist_batch, start_index=start_index),
+                    self._find_best_matches_batch_for_candidates(
+                        events,
+                        artist_batch,
+                        start_index=start_index,
+                        compact_candidates=True,
+                    ),
                 )
             return suggestions
 
-        return self._find_best_matches_batch_for_candidates(events, artists, start_index=start_index)
+        return self._find_best_matches_batch_for_candidates(
+            events,
+            artists,
+            start_index=start_index,
+            compact_candidates=True,
+        )
 
     def _find_best_matches_batch_for_candidates(
         self,
@@ -688,7 +730,7 @@ class AiArtistReviewer:
         )
         try:
             return self._parse_with_ai_repair(
-                self._chat_content(payload),
+                self._guarded_chat_content(payload),
                 parse_ai_batch_match_suggestions,
                 '{"matches":[{"event_index": number, "artist_name": string|null, "confidence": "高|中|低", "reason": string}]}',
             )
@@ -697,7 +739,7 @@ class AiArtistReviewer:
                 raise
             if len(events) <= 1:
                 if len(artists) <= 1:
-                    return {}
+                    raise
                 midpoint = len(artists) // 2
                 suggestions = self._find_best_matches_batch_for_candidates(
                     events,

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import os
-import threading
+import re
+import shutil
 import time
 import uuid
 from pathlib import Path
@@ -13,10 +14,12 @@ except ImportError as exc:
     raise RuntimeError("Flask is not installed. Run `pip install -r requirements.txt` before starting the web app.") from exc
 
 from services.debug_timing import debug_log
+from services.job_manager import JobBusyError, MatchJobManager
 from services.pipeline import run_match_pipeline, save_uploaded_images
 
 
 FORBIDDEN_EXTERNAL_MESSAGE = "外部服务拒绝访问（403），请检查链接是否公开，或稍后重试。"
+JOB_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
 
 def load_local_env_file(path: Path = Path(".env")) -> None:
@@ -40,10 +43,19 @@ def load_local_env_file(path: Path = Path(".env")) -> None:
 load_local_env_file()
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_UPLOAD_MB", "80")) * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_UPLOAD_MB", "30")) * 1024 * 1024
 
 OUTPUT_ROOT = Path(os.environ.get("OUTPUT_ROOT", "outputs/webapp"))
-_match_lock = threading.Lock()
+_job_manager = MatchJobManager(
+    OUTPUT_ROOT / "jobs",
+    OUTPUT_ROOT,
+    ttl_seconds=int(os.environ.get("JOB_TTL_SECONDS", "86400")),
+)
+
+
+@app.errorhandler(413)
+def request_too_large(error):
+    return jsonify({"error": "上传内容过大，请减少图片数量或压缩图片后重试。"}), 413
 
 
 @app.get("/")
@@ -53,7 +65,15 @@ def index():
 
 @app.get("/api/status")
 def api_status():
-    return jsonify({"match_in_progress": _match_lock.locked()})
+    return jsonify({"match_in_progress": _job_manager.is_busy()})
+
+
+@app.get("/api/jobs/<job_id>")
+def api_job(job_id: str):
+    snapshot = _job_manager.get(job_id)
+    if snapshot is None:
+        return jsonify({"error": "任务不存在或已过期"}), 404
+    return jsonify(snapshot)
 
 
 @app.post("/api/match")
@@ -67,40 +87,33 @@ def api_match():
     )
 
     if not netease_url:
-        return jsonify({"error": "\u8bf7\u586b\u5199\u7f51\u6613\u4e91\u6b4c\u5355\u94fe\u63a5"}), 400
+        return jsonify({"error": "请填写网易云歌单链接"}), 400
 
-    upload_dir = OUTPUT_ROOT / "uploads" / uuid.uuid4().hex
+    if _job_manager.is_busy():
+        return jsonify({"error": "已有匹配任务在进行中，请等待完成后再试"}), 409
+
+    job_id = uuid.uuid4().hex
+    upload_dir = OUTPUT_ROOT / job_id / "uploads"
     uploaded = save_uploaded_images(uploaded_files, upload_dir)
 
     if not xhs_url and not uploaded:
-        return jsonify({"error": "\u8bf7\u586b\u5199\u5c0f\u7ea2\u4e66\u94fe\u63a5\uff0c\u6216\u4e0a\u4f20\u5c0f\u7ea2\u4e66\u56fe\u7247"}), 400
+        shutil.rmtree(OUTPUT_ROOT / job_id, ignore_errors=True)
+        return jsonify({"error": "请填写小红书链接，或上传小红书图片"}), 400
 
-    if not _match_lock.acquire(blocking=False):
-        # #region agent log
-        debug_log(
-            "app.py:api_match",
-            "match request rejected busy",
-            {},
-            hypothesis_id="H8",
-        )
-        # #endregion
-        return jsonify({"error": "\u5df2\u6709\u5339\u914d\u4efb\u52a1\u5728\u8fdb\u884c\u4e2d\uff0c\u8bf7\u7b49\u5f85\u5b8c\u6210\u540e\u518d\u8bd5"}), 409
-
-    # #region agent log
     request_started = time.perf_counter()
     debug_log(
         "app.py:api_match",
-        "match request started",
+        "match job accepted",
         {
+            "jobId": job_id,
             "uploadedImageCount": len(uploaded),
             "hasXhsUrl": bool(xhs_url),
             "useAi": use_ai,
         },
         hypothesis_id="H5",
     )
-    # #endregion
 
-    try:
+    def run_job(progress_callback):
         try:
             result = run_match_pipeline(
                 netease_url,
@@ -108,69 +121,96 @@ def api_match():
                 uploaded_images=uploaded,
                 output_root=OUTPUT_ROOT,
                 use_ai=use_ai,
+                job_id=job_id,
+                progress_callback=progress_callback,
             )
         except HTTPError as exc:
             if exc.code == 403:
-                return jsonify({"error": FORBIDDEN_EXTERNAL_MESSAGE}), 502
-            return jsonify({"error": f"外部服务请求失败：HTTP {exc.code}"}), 502
+                raise RuntimeError(FORBIDDEN_EXTERNAL_MESSAGE) from exc
+            raise RuntimeError(f"外部服务请求失败：HTTP {exc.code}") from exc
         except Exception as exc:
-            # #region agent log
             debug_log(
                 "app.py:api_match",
-                "match request failed",
-                {"error": str(exc)},
+                "match job failed",
+                {"jobId": job_id, "error": str(exc)},
                 hypothesis_id="H5",
             )
-            # #endregion
-            return jsonify({"error": str(exc)}), 500
+            raise
 
-        # #region agent log
+        elapsed_ms = int((time.perf_counter() - request_started) * 1000)
         debug_log(
             "app.py:api_match",
-            "match request completed",
+            "match job completed",
             {
-                "elapsedMs": int((time.perf_counter() - request_started) * 1000),
+                "jobId": job_id,
+                "elapsedMs": elapsed_ms,
                 "eventCount": result.event_count,
                 "matchCount": len(result.matches),
                 "warningCount": len(result.warnings),
             },
             hypothesis_id="H5",
         )
-        # #endregion
+        return _serialize_pipeline_result(result, total_elapsed_ms=elapsed_ms)
 
-        download_url = f"/download/{result.excel_path.parent.name}" if result.excel_path else ""
-        return jsonify(
-            {
-                "matches": [
-                    {
-                        "index": match.index,
-                        "date": match.date_display,
-                        "artist": match.artist_name,
-                        "venue": match.venue,
-                        "playlist_song_count": match.playlist_song_count,
-                        "sample_songs": match.sample_songs,
-                        "confidence": match.confidence,
-                    }
-                    for match in result.matches
-                ],
-                "playlist_artist_count": result.playlist_artist_count,
-                "event_count": result.event_count,
-                "warnings": result.warnings,
-                "download_url": download_url,
-                "phase_timings": result.phase_timings,
-                "total_elapsed_ms": int((time.perf_counter() - request_started) * 1000),
-            }
+    try:
+        created = _job_manager.start(job_id, run_job)
+    except JobBusyError as exc:
+        shutil.rmtree(OUTPUT_ROOT / job_id, ignore_errors=True)
+        debug_log(
+            "app.py:api_match",
+            "match request rejected busy",
+            {"activeJobId": exc.active_job_id},
+            hypothesis_id="H8",
         )
-    finally:
-        _match_lock.release()
+        return (
+            jsonify({"error": "已有匹配任务在进行中，请等待完成后再试"}),
+            409,
+        )
+
+    return (
+        jsonify(
+            {
+                "job_id": job_id,
+                "state": created["state"],
+                "status_url": f"/api/jobs/{job_id}",
+            }
+        ),
+        202,
+    )
+
+
+def _serialize_pipeline_result(result, *, total_elapsed_ms: int) -> dict:
+    download_url = f"/download/{result.excel_path.parent.name}" if result.excel_path else ""
+    return {
+        "matches": [
+            {
+                "index": match.index,
+                "date": match.date_display,
+                "artist": match.artist_name,
+                "venue": match.venue,
+                "playlist_song_count": match.playlist_song_count,
+                "sample_songs": match.sample_songs,
+                "confidence": match.confidence,
+            }
+            for match in result.matches
+        ],
+        "playlist_artist_count": result.playlist_artist_count,
+        "event_count": result.event_count,
+        "warnings": result.warnings,
+        "download_url": download_url,
+        "phase_timings": result.phase_timings,
+        "total_elapsed_ms": total_elapsed_ms,
+    }
 
 
 @app.get("/download/<job_id>")
 def download(job_id: str):
+    if not JOB_ID_PATTERN.fullmatch(job_id):
+        return jsonify({"error": "文件不存在或已过期"}), 404
     path = OUTPUT_ROOT / job_id / "matches.xlsx"
     if not path.exists():
-        return jsonify({"error": "\u6587\u4ef6\u4e0d\u5b58\u5728\u6216\u5df2\u8fc7\u671f"}), 404
-    return send_file(path, as_attachment=True, download_name="\u6f14\u51fa\u5339\u914d\u7ed3\u679c.xlsx")
+        return jsonify({"error": "文件不存在或已过期"}), 404
+    return send_file(path, as_attachment=True, download_name="演出匹配结果.xlsx")
 
 
 if __name__ == "__main__":
