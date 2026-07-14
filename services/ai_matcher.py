@@ -31,6 +31,7 @@ class AiMatchSuggestion:
     artist_name: str
     confidence: str
     reason: str
+    event_performer: str = ""
 
 
 @dataclass(frozen=True)
@@ -81,7 +82,7 @@ class AiMatchConfig:
 
     @property
     def cache_source(self) -> str:
-        return f"ai-match:v7:{self.base_url}:{self.model}:c{self.candidate_limit}:mode{self.mode}"
+        return f"ai-match:v8:{self.base_url}:{self.model}:c{self.candidate_limit}:mode{self.mode}"
 
 
 def build_review_payload(event: EventRow, artist: PlaylistArtist, model: str = "gpt-4.1-mini") -> dict[str, Any]:
@@ -166,6 +167,7 @@ def build_batch_artist_pick_payload(
     model: str = "gpt-4.1-mini",
     candidate_limit: int | None = 120,
     start_index: int = 0,
+    event_indices: list[int] | None = None,
     compact_candidates: bool = False,
 ) -> dict[str, Any]:
     system = (
@@ -173,8 +175,9 @@ def build_batch_artist_pick_payload(
         "\u4ece\u7ed9\u5b9a\u7684\u6b4c\u5355\u6b4c\u624b\u5019\u9009\u4e2d\uff0c"
         "\u4e3a\u6bcf\u4e2a\u6f14\u51fa\u540d\u9009\u62e9\u6700\u53ef\u80fd\u7684\u6b4c\u5355\u6b4c\u624b\u3002"
         "\u5fc5\u987b\u53ea\u8fd4\u56de\u4e25\u683c JSON\uff0c\u683c\u5f0f\u4e3a "
-        '{"matches":[{"event_index": number, "artist_name": string|null, "confidence": "\u9ad8|\u4e2d|\u4f4e", "reason": string}]}\u3002'
+        '{"matches":[{"event_index": number, "event_performer": string, "artist_name": string|null, "confidence": "\u9ad8|\u4e2d|\u4f4e", "reason": string}]}\u3002'
         "event_index \u5fc5\u987b\u4f7f\u7528\u8f93\u5165\u91cc\u7684 event_index\u3002"
+        "event_performer \u5fc5\u987b\u539f\u6837\u5199\u56de\u540c\u4e00\u4e2a event_index \u7684\u8f93\u5165\u6f14\u51fa\u540d\u3002"
         "\u660e\u786e\u662f\u540c\u4e00\u6b4c\u624b\u6216\u7ec4\u5408\u7684\u4e0d\u540c\u5199\u6cd5\u5fc5\u987b\u9009\u62e9\u8be5\u5019\u9009\uff0c\u5305\u542b\u4e2d\u82f1\u6587/\u62fc\u97f3/\u8bd1\u540d\u3001\u827a\u540d\u4e0e\u672c\u540d\u3001\u7b80\u7e41\u4f53\u3001"
         "\u7a7a\u683c\u6216\u7b26\u53f7\u5dee\u5f02\uff0c\u4ee5\u53ca\u53ef\u660e\u786e\u8fd8\u539f\u7684 OCR \u9519\u5b57\u3002"
         "\u4e0a\u8ff0\u8eab\u4efd\u5bf9\u5e94\u6e05\u6670\u4f46\u5199\u6cd5\u5b58\u5728\u8f7b\u5fae\u6b67\u4e49\u65f6\uff0c\u8fd4\u56de\u4e2d\u7f6e\u4fe1\u5ea6\uff0c\u4e0d\u8981\u76f4\u63a5\u8fd4\u56de null\u3002"
@@ -186,14 +189,21 @@ def build_batch_artist_pick_payload(
         "\u65e0\u6cd5\u786e\u8ba4\u7684\u6f14\u51fa\u4e0d\u8981\u8f93\u51fa\u5bf9\u8c61\uff0c"
         "\u4e0d\u8981\u8fd4\u56de artist_name: null \u7684\u884c\u3002"
     )
+    if event_indices is None:
+        resolved_event_indices = [start_index + index for index in range(len(events))]
+    else:
+        if len(event_indices) != len(events):
+            raise ValueError("event_indices must match events")
+        resolved_event_indices = list(event_indices)
+
     event_items = [
         {
-            "event_index": start_index + index,
+            "event_index": event_index,
             "event_performer": event.performer,
             "event_date": event.date_text,
             "event_venue": event.venue,
         }
-        for index, event in enumerate(events)
+        for event_index, event in zip(resolved_event_indices, events)
     ]
     selected_artists = artists if candidate_limit is None else artists[:candidate_limit]
     candidates = [
@@ -334,20 +344,23 @@ def parse_ai_batch_match_suggestions(raw_text: str) -> dict[int, AiMatchSuggesti
             artist_name=str(artist_name).strip(),
             confidence=confidence,
             reason=str(item.get("reason", "")).strip(),
+            event_performer=str(item.get("event_performer", "")).strip(),
         )
     return suggestions
 
 
-MATCH_CACHE_VERSION = 2
+MATCH_CACHE_VERSION = 3
 
 
 def _match_cache_fingerprint(
     events: list[EventRow],
     artists: list[PlaylistArtist],
     cache_source: str,
+    event_indices: list[int],
 ) -> str:
     payload = {
         "source": cache_source,
+        "event_indices": event_indices,
         "events": [
             {
                 "date_text": event.date_text,
@@ -373,9 +386,10 @@ def _match_cache_path(
     events: list[EventRow],
     artists: list[PlaylistArtist],
     cache_source: str,
+    event_indices: list[int],
     output_root: Path | None,
 ) -> Path:
-    fingerprint = _match_cache_fingerprint(events, artists, cache_source)
+    fingerprint = _match_cache_fingerprint(events, artists, cache_source, event_indices)
     return cache_root(output_root) / f"ai-match-{fingerprint}.json"
 
 
@@ -384,6 +398,7 @@ def _suggestion_to_dict(suggestion: AiMatchSuggestion) -> dict[str, str]:
         "artist_name": suggestion.artist_name,
         "confidence": suggestion.confidence,
         "reason": suggestion.reason,
+        "event_performer": suggestion.event_performer,
     }
 
 
@@ -392,6 +407,7 @@ def _suggestion_from_dict(data: dict[str, Any]) -> AiMatchSuggestion:
         artist_name=str(data["artist_name"]),
         confidence=str(data["confidence"]),
         reason=str(data.get("reason", "")),
+        event_performer=str(data.get("event_performer", "")),
     )
 
 
@@ -399,12 +415,13 @@ def _load_match_cache(
     events: list[EventRow],
     artists: list[PlaylistArtist],
     cache_source: str,
+    event_indices: list[int],
     output_root: Path | None,
 ) -> dict[int, AiMatchSuggestion] | None:
     if output_root is None or not cache_enabled():
         return None
 
-    path = _match_cache_path(events, artists, cache_source, output_root)
+    path = _match_cache_path(events, artists, cache_source, event_indices, output_root)
     if not path.exists():
         return None
 
@@ -417,7 +434,7 @@ def _load_match_cache(
         return None
     if payload.get("cache_source") != cache_source:
         return None
-    expected_fingerprint = _match_cache_fingerprint(events, artists, cache_source)
+    expected_fingerprint = _match_cache_fingerprint(events, artists, cache_source, event_indices)
     if payload.get("fingerprint") != expected_fingerprint:
         return None
 
@@ -434,6 +451,7 @@ def _save_match_cache(
     events: list[EventRow],
     artists: list[PlaylistArtist],
     cache_source: str,
+    event_indices: list[int],
     suggestions: dict[int, AiMatchSuggestion],
     output_root: Path | None,
 ) -> None:
@@ -442,7 +460,7 @@ def _save_match_cache(
 
     cache_dir = cache_root(output_root)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    fingerprint = _match_cache_fingerprint(events, artists, cache_source)
+    fingerprint = _match_cache_fingerprint(events, artists, cache_source, event_indices)
     payload = {
         "cache_version": MATCH_CACHE_VERSION,
         "cache_source": cache_source,
@@ -451,7 +469,7 @@ def _save_match_cache(
             str(index): _suggestion_to_dict(suggestion) for index, suggestion in sorted(suggestions.items())
         },
     }
-    _match_cache_path(events, artists, cache_source, output_root).write_text(
+    _match_cache_path(events, artists, cache_source, event_indices, output_root).write_text(
         json.dumps(payload, ensure_ascii=False),
         encoding="utf-8",
     )
@@ -485,6 +503,47 @@ def _merge_suggestions(
         ):
             merged[index] = suggestion
     return merged
+
+
+def _resolved_event_indices(events: list[EventRow], start_index: int, event_indices: list[int] | None) -> list[int]:
+    if event_indices is None:
+        return [start_index + index for index in range(len(events))]
+    if len(event_indices) != len(events):
+        raise ValueError("event_indices must match events")
+    return list(event_indices)
+
+
+def _validate_batch_suggestions(
+    suggestions: dict[int, AiMatchSuggestion],
+    events: list[EventRow],
+    event_indices: list[int],
+    require_event_performer: bool,
+) -> dict[int, AiMatchSuggestion]:
+    events_by_index = dict(zip(event_indices, events))
+    accepted: dict[int, AiMatchSuggestion] = {}
+    for event_index, suggestion in suggestions.items():
+        event = events_by_index.get(event_index)
+        if event is None:
+            debug_log(
+                "ai_matcher.py:_validate_batch_suggestions",
+                "ignored ai match outside current batch",
+                {"eventIndex": event_index},
+                hypothesis_id="H8",
+            )
+            continue
+        if require_event_performer:
+            from services.matcher import normalize_name
+
+            if not suggestion.event_performer or normalize_name(suggestion.event_performer) != normalize_name(event.performer):
+                debug_log(
+                    "ai_matcher.py:_validate_batch_suggestions",
+                    "ignored ai match with mismatched event performer",
+                    {"eventIndex": event_index},
+                    hypothesis_id="H8",
+                )
+                continue
+        accepted[event_index] = suggestion
+    return accepted
 
 
 class AiArtistReviewer:
@@ -544,12 +603,24 @@ class AiArtistReviewer:
         if not self.config.enabled or not artists:
             return None
 
-        return self._find_best_matches_batch([event], artists, start_index=0).get(0)
+        return self._find_best_matches_batch(
+            [event],
+            artists,
+            start_index=0,
+            event_indices=[0],
+        ).get(0)
 
-    def find_best_matches(self, events: list[EventRow], artists: list[PlaylistArtist]) -> dict[int, AiMatchSuggestion]:
+    def find_best_matches(
+        self,
+        events: list[EventRow],
+        artists: list[PlaylistArtist],
+        event_indices: list[int] | None = None,
+    ) -> dict[int, AiMatchSuggestion]:
         if not self.config.enabled or not events or not artists:
             return {}
 
+        resolved_indices = _resolved_event_indices(events, 0, event_indices)
+        require_event_performer = event_indices is not None
         with PhaseTimer("ai_matcher.py:find_best_matches", "ai_match_total") as timer:
             timer.data = {
                 "eventCount": len(events),
@@ -557,7 +628,7 @@ class AiArtistReviewer:
                 "mode": self.config.mode,
             }
             self.last_failures = []
-            cached = _load_match_cache(events, artists, self.config.cache_source, self.output_root)
+            cached = _load_match_cache(events, artists, self.config.cache_source, resolved_indices, self.output_root)
             if cached is not None:
                 timer.data["cacheHit"] = True
                 timer.data["suggestionCount"] = len(cached)
@@ -567,31 +638,44 @@ class AiArtistReviewer:
                 self._deadline = time.monotonic() + self.config.max_elapsed_seconds
 
             if len(events) > LARGE_EVENT_SET_SINGLE_PASS_THRESHOLD:
-                suggestions = self._find_best_matches_for_candidate_groups(events, artists)
+                suggestions = self._find_best_matches_for_candidate_groups(
+                    events,
+                    artists,
+                    resolved_indices,
+                    require_event_performer,
+                )
                 if not self.last_failures:
-                    _save_match_cache(events, artists, self.config.cache_source, suggestions, self.output_root)
+                    _save_match_cache(events, artists, self.config.cache_source, resolved_indices, suggestions, self.output_root)
                 timer.data["suggestionCount"] = len(suggestions)
                 timer.data["failureCount"] = len(self.last_failures)
                 return suggestions
 
             batch_size = max(1, self.config.event_batch_size)
-            batches = [(start_index, batch) for start_index, batch in enumerate(_chunked(events, batch_size))]
-            batches = [(index * batch_size, batch) for index, batch in batches]
+            batches = [
+                (events[offset : offset + batch_size], resolved_indices[offset : offset + batch_size])
+                for offset in range(0, len(events), batch_size)
+            ]
             suggestions: dict[int, AiMatchSuggestion] = {}
             worker_count = min(max(1, self.config.event_workers), len(batches))
             if worker_count <= 1:
-                for start_index, batch in batches:
+                for batch, batch_indices in batches:
                     try:
                         suggestions = _merge_suggestions(
                             suggestions,
-                            self._find_best_matches_batch(batch, artists, start_index=start_index),
+                            self._find_best_matches_batch(
+                                batch,
+                                artists,
+                                start_index=batch_indices[0],
+                                event_indices=batch_indices,
+                                require_event_performer=require_event_performer,
+                            ),
                         )
                     except Exception as exc:
                         self.last_failures.append(exc)
                 if len(self.last_failures) == len(batches):
                     raise self.last_failures[0]
                 if not self.last_failures:
-                    _save_match_cache(events, artists, self.config.cache_source, suggestions, self.output_root)
+                    _save_match_cache(events, artists, self.config.cache_source, resolved_indices, suggestions, self.output_root)
                 timer.data["suggestionCount"] = len(suggestions)
                 timer.data["failureCount"] = len(self.last_failures)
                 timer.data["batchCount"] = len(batches)
@@ -599,8 +683,15 @@ class AiArtistReviewer:
 
             with ThreadPoolExecutor(max_workers=worker_count) as executor:
                 futures = {
-                    executor.submit(self._find_best_matches_batch, batch, artists, start_index): start_index
-                    for start_index, batch in batches
+                    executor.submit(
+                        self._find_best_matches_batch,
+                        batch,
+                        artists,
+                        batch_indices[0],
+                        batch_indices,
+                        require_event_performer,
+                    ): batch_indices[0]
+                    for batch, batch_indices in batches
                 }
                 for future in as_completed(futures):
                     try:
@@ -610,7 +701,7 @@ class AiArtistReviewer:
             if len(self.last_failures) == len(batches):
                 raise self.last_failures[0]
             if not self.last_failures:
-                _save_match_cache(events, artists, self.config.cache_source, suggestions, self.output_root)
+                _save_match_cache(events, artists, self.config.cache_source, resolved_indices, suggestions, self.output_root)
             timer.data["suggestionCount"] = len(suggestions)
             timer.data["failureCount"] = len(self.last_failures)
             timer.data["batchCount"] = len(batches)
@@ -620,17 +711,22 @@ class AiArtistReviewer:
         self,
         events: list[EventRow],
         artists: list[PlaylistArtist],
+        event_indices: list[int],
+        require_event_performer: bool,
     ) -> dict[int, AiMatchSuggestion]:
         candidate_batches = _chunked(artists, max(1, self.config.candidate_limit))
         event_batch_size = max(1, self.config.event_batch_size)
         event_batches = [
-            (index * event_batch_size, batch)
-            for index, batch in enumerate(_chunked(events, event_batch_size))
+            (
+                events[offset : offset + event_batch_size],
+                event_indices[offset : offset + event_batch_size],
+            )
+            for offset in range(0, len(events), event_batch_size)
         ]
         work_items = [
-            (event_batch, artist_batch, start_index)
+            (event_batch, batch_indices, artist_batch)
             for artist_batch in candidate_batches
-            for start_index, event_batch in event_batches
+            for event_batch, batch_indices in event_batches
         ]
         # #region agent log
         debug_log(
@@ -650,14 +746,16 @@ class AiArtistReviewer:
         suggestions: dict[int, AiMatchSuggestion] = {}
         worker_count = min(max(1, self.config.event_workers), len(work_items))
         if worker_count <= 1:
-            for event_batch, artist_batch, start_index in work_items:
+            for event_batch, batch_indices, artist_batch in work_items:
                 try:
                     suggestions = _merge_suggestions(
                         suggestions,
                         self._find_best_matches_batch_for_candidates(
                             event_batch,
                             artist_batch,
-                            start_index=start_index,
+                            start_index=batch_indices[0],
+                            event_indices=batch_indices,
+                            require_event_performer=require_event_performer,
                             compact_candidates=True,
                         ),
                     )
@@ -670,10 +768,12 @@ class AiArtistReviewer:
                         self._find_best_matches_batch_for_candidates,
                         event_batch,
                         artist_batch,
-                        start_index,
+                        batch_indices[0],
                         True,
+                        batch_indices,
+                        require_event_performer,
                     )
-                    for event_batch, artist_batch, start_index in work_items
+                    for event_batch, batch_indices, artist_batch in work_items
                 ]
                 for future in as_completed(futures):
                     try:
@@ -690,7 +790,10 @@ class AiArtistReviewer:
         events: list[EventRow],
         artists: list[PlaylistArtist],
         start_index: int,
+        event_indices: list[int] | None = None,
+        require_event_performer: bool = False,
     ) -> dict[int, AiMatchSuggestion]:
+        resolved_indices = _resolved_event_indices(events, start_index, event_indices)
         candidate_batch_size = max(1, self.config.candidate_limit)
         if len(artists) > candidate_batch_size:
             suggestions: dict[int, AiMatchSuggestion] = {}
@@ -701,6 +804,8 @@ class AiArtistReviewer:
                         events,
                         artist_batch,
                         start_index=start_index,
+                        event_indices=resolved_indices,
+                        require_event_performer=require_event_performer,
                         compact_candidates=True,
                     ),
                 )
@@ -710,6 +815,8 @@ class AiArtistReviewer:
             events,
             artists,
             start_index=start_index,
+            event_indices=resolved_indices,
+            require_event_performer=require_event_performer,
             compact_candidates=True,
         )
 
@@ -719,20 +826,30 @@ class AiArtistReviewer:
         artists: list[PlaylistArtist],
         start_index: int,
         compact_candidates: bool = False,
+        event_indices: list[int] | None = None,
+        require_event_performer: bool = False,
     ) -> dict[int, AiMatchSuggestion]:
+        resolved_indices = _resolved_event_indices(events, start_index, event_indices)
         payload = build_batch_artist_pick_payload(
             events,
             artists,
             model=self.config.model,
             candidate_limit=self.config.candidate_limit,
             start_index=start_index,
+            event_indices=resolved_indices,
             compact_candidates=compact_candidates,
         )
         try:
-            return self._parse_with_ai_repair(
+            suggestions = self._parse_with_ai_repair(
                 self._guarded_chat_content(payload),
                 parse_ai_batch_match_suggestions,
-                '{"matches":[{"event_index": number, "artist_name": string|null, "confidence": "高|中|低", "reason": string}]}',
+                '{"matches":[{"event_index": number, "event_performer": string, "artist_name": string|null, "confidence": "高|中|低", "reason": string}]}',
+            )
+            return _validate_batch_suggestions(
+                suggestions,
+                events,
+                resolved_indices,
+                require_event_performer,
             )
         except Exception as exc:
             if not _is_timeout_error(exc):
@@ -746,6 +863,8 @@ class AiArtistReviewer:
                     artists[:midpoint],
                     start_index=start_index,
                     compact_candidates=compact_candidates,
+                    event_indices=resolved_indices,
+                    require_event_performer=require_event_performer,
                 )
                 return _merge_suggestions(
                     suggestions,
@@ -754,6 +873,8 @@ class AiArtistReviewer:
                         artists[midpoint:],
                         start_index=start_index,
                         compact_candidates=compact_candidates,
+                        event_indices=resolved_indices,
+                        require_event_performer=require_event_performer,
                     ),
                 )
             midpoint = len(events) // 2
@@ -762,14 +883,18 @@ class AiArtistReviewer:
                 artists,
                 start_index=start_index,
                 compact_candidates=compact_candidates,
+                event_indices=resolved_indices[:midpoint],
+                require_event_performer=require_event_performer,
             )
             return _merge_suggestions(
                 suggestions,
                 self._find_best_matches_batch_for_candidates(
-                    events[midpoint:],
-                    artists,
-                    start_index=start_index + midpoint,
-                    compact_candidates=compact_candidates,
+                events[midpoint:],
+                artists,
+                start_index=resolved_indices[midpoint],
+                compact_candidates=compact_candidates,
+                event_indices=resolved_indices[midpoint:],
+                require_event_performer=require_event_performer,
                 ),
             )
 

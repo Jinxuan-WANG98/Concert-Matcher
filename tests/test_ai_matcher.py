@@ -65,7 +65,7 @@ class AiMatcherTest(unittest.TestCase):
             model="text-model",
         )
 
-        self.assertTrue(config.cache_source.startswith("ai-match:v7:"))
+        self.assertTrue(config.cache_source.startswith("ai-match:v8:"))
 
     def test_config_defaults_bound_calls_and_use_two_workers(self):
         config = AiMatchConfig()
@@ -252,6 +252,22 @@ class AiMatcherTest(unittest.TestCase):
         self.assertIn("Zella Day", content)
         self.assertIn("matches", payload["messages"][0]["content"])
 
+    def test_batch_payload_uses_explicit_original_event_indices(self):
+        events = [
+            EventRow(date_text="9.6", performer="叶琼琳", venue="新歌空间"),
+            EventRow(date_text="9.12", performer="VoX LoW", venue="星在"),
+        ]
+        payload = build_batch_artist_pick_payload(
+            events,
+            [PlaylistArtist(name="VOX LOW", song_count=1, sample_songs=[])],
+            event_indices=[101, 116],
+        )
+
+        user = json.loads(payload["messages"][-1]["content"].split("JSON:\n", 1)[1])
+
+        self.assertEqual([item["event_index"] for item in user["events"]], [101, 116])
+        self.assertIn("event_performer", payload["messages"][0]["content"])
+
     def test_batch_payload_allows_clear_alias_and_ocr_identity_matches(self):
         payload = build_batch_artist_pick_payload(
             [EventRow(date_text="10.24", performer="Jackson Wang", venue="")],
@@ -285,6 +301,54 @@ class AiMatcherTest(unittest.TestCase):
             suggestions,
             {0: AiMatchSuggestion(artist_name="Zella Day", confidence="\u9ad8", reason="OCR \u5b57\u5f62\u6df7\u6dc6")},
         )
+
+    def test_parse_ai_batch_match_suggestion_keeps_echoed_performer(self):
+        suggestions = parse_ai_batch_match_suggestions(
+            '{"matches":[{"event_index":116,"event_performer":"VoX LoW",'
+            '"artist_name":"VOX LOW","confidence":"\u9ad8","reason":"\u540c\u540d"}]}'
+        )
+
+        self.assertEqual(suggestions[116].event_performer, "VoX LoW")
+
+    def test_reviewer_rejects_unknown_index_and_mismatched_performer(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+            event_batch_size=2,
+            event_workers=1,
+        )
+        reviewer = AiArtistReviewer(config)
+        reviewer._chat_content = lambda payload: json.dumps(
+            {
+                "matches": [
+                    {
+                        "event_index": 999,
+                        "event_performer": "VoX LoW",
+                        "artist_name": "VOX LOW",
+                        "confidence": "高",
+                        "reason": "wrong batch",
+                    },
+                    {
+                        "event_index": 101,
+                        "event_performer": "VoX LoW",
+                        "artist_name": "VOX LOW",
+                        "confidence": "高",
+                        "reason": "wrong row",
+                    },
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+        suggestions = reviewer.find_best_matches(
+            [EventRow(date_text="9.6", performer="叶琼琳", venue="新歌空间")],
+            [PlaylistArtist(name="VOX LOW", song_count=1, sample_songs=[])],
+            event_indices=[101],
+        )
+
+        self.assertEqual(suggestions, {})
 
     def test_reviewer_batches_event_matching_requests(self):
         config = AiMatchConfig(
@@ -501,7 +565,7 @@ class AiMatcherTest(unittest.TestCase):
         active_count = 0
         max_active_count = 0
 
-        def fake_batch(batch, artists, start_index):
+        def fake_batch(batch, artists, start_index, event_indices=None, require_event_performer=False):
             nonlocal active_count, max_active_count
             with lock:
                 active_count += 1
@@ -545,7 +609,7 @@ class AiMatcherTest(unittest.TestCase):
         )
         reviewer = AiArtistReviewer(config)
 
-        def fake_batch(batch, artists, start_index):
+        def fake_batch(batch, artists, start_index, event_indices=None, require_event_performer=False):
             if start_index == 0:
                 raise RuntimeError("provider rejected this batch")
             return {
@@ -593,7 +657,7 @@ class AiMatcherTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             reviewer = AiArtistReviewer(config, output_root=Path(tmp))
 
-            def partially_failing_batch(batch, artists, start_index):
+            def partially_failing_batch(batch, artists, start_index, event_indices=None, require_event_performer=False):
                 if start_index == 0:
                     raise RuntimeError("provider rejected this batch")
                 return {
@@ -609,7 +673,7 @@ class AiMatcherTest(unittest.TestCase):
 
             calls = []
 
-            def successful_batch(batch, artists, start_index):
+            def successful_batch(batch, artists, start_index, event_indices=None, require_event_performer=False):
                 calls.append(start_index)
                 return {
                     start_index: AiMatchSuggestion(
