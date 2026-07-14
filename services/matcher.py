@@ -175,27 +175,76 @@ def _score_pair(alias: Alias, artist_name: str) -> tuple[float, str, str] | None
     return None
 
 
+def _find_unique_exact_anchor(event: EventRow, artists: list[PlaylistArtist]) -> PlaylistArtist | None:
+    performer_key = normalize_name(event.performer)
+    if not performer_key:
+        return None
+
+    exact_matches = [artist for artist in artists if normalize_name(artist.name) == performer_key]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+
+    if _has_latin(event.performer) and len(performer_key) >= 4:
+        ocr_key = normalize_ocr_latin(event.performer)
+        ocr_matches = [artist for artist in artists if normalize_ocr_latin(artist.name) == ocr_key]
+        if len(ocr_matches) == 1:
+            return ocr_matches[0]
+    return None
+
+
+def _match_ai_only_with_exact_anchors(
+    events: list[EventRow],
+    artists: list[PlaylistArtist],
+    ai_reviewer,
+) -> list[MatchResult]:
+    anchors = {
+        event_index: artist
+        for event_index, event in enumerate(events)
+        if (artist := _find_unique_exact_anchor(event, artists)) is not None
+    }
+    anchored_artist_keys = {normalize_name(artist.name) for artist in anchors.values()}
+    unresolved_indices = [event_index for event_index in range(len(events)) if event_index not in anchors]
+    unresolved_events = [events[event_index] for event_index in unresolved_indices]
+    remaining_artists = [artist for artist in artists if normalize_name(artist.name) not in anchored_artist_keys]
+
+    batch_suggestions = None
+    if unresolved_events and remaining_artists and ai_reviewer is not None and hasattr(ai_reviewer, "find_best_matches"):
+        batch_suggestions = ai_reviewer.find_best_matches(
+            unresolved_events,
+            remaining_artists,
+            event_indices=unresolved_indices,
+        )
+    allow_single_fallback = batch_suggestions is None or len(unresolved_events) <= AI_ONLY_SINGLE_FALLBACK_EVENT_LIMIT
+
+    raw_matches = [_match_from_exact_anchor(events[event_index], artist) for event_index, artist in anchors.items()]
+    for event_index, event in zip(unresolved_indices, unresolved_events):
+        suggestion = batch_suggestions.get(event_index) if batch_suggestions is not None else None
+        if (
+            suggestion is None
+            and allow_single_fallback
+            and remaining_artists
+            and ai_reviewer is not None
+            and hasattr(ai_reviewer, "find_best_match")
+        ):
+            suggestion = ai_reviewer.find_best_match(event, remaining_artists)
+        if suggestion is None or suggestion.confidence == "\u4f4e":
+            continue
+        suggested_artist = _find_artist_by_name(remaining_artists, suggestion.artist_name)
+        if suggested_artist is not None:
+            raw_matches.append(_match_from_ai_suggestion(event, suggested_artist, suggestion, "\u76f4\u63a5\u5339\u914d"))
+    return raw_matches
+
+
 def match_events_to_artists(
     events: list[EventRow],
     artists: list[PlaylistArtist],
     ai_reviewer=None,
     ai_only: bool = False,
 ) -> list[MatchResult]:
-    raw_matches: list[MatchResult] = []
-    batch_suggestions = None
-    if ai_only and ai_reviewer is not None and hasattr(ai_reviewer, "find_best_matches"):
-        batch_suggestions = ai_reviewer.find_best_matches(events, artists)
-    allow_single_fallback = batch_suggestions is None or len(events) <= AI_ONLY_SINGLE_FALLBACK_EVENT_LIMIT
+    raw_matches = _match_ai_only_with_exact_anchors(events, artists, ai_reviewer) if ai_only else []
 
     for event_index, event in enumerate(events):
-        if ai_only and ai_reviewer is not None and hasattr(ai_reviewer, "find_best_match"):
-            suggestion = batch_suggestions.get(event_index) if batch_suggestions is not None else None
-            if suggestion is None and allow_single_fallback:
-                suggestion = ai_reviewer.find_best_match(event, artists)
-            if suggestion is not None and suggestion.confidence != "\u4f4e":
-                suggested_artist = _find_artist_by_name(artists, suggestion.artist_name)
-                if suggested_artist is not None:
-                    raw_matches.append(_match_from_ai_suggestion(event, suggested_artist, suggestion, "\u76f4\u63a5\u5339\u914d"))
+        if ai_only:
             continue
 
         event_match_count = 0
@@ -382,6 +431,24 @@ def _find_artist_by_name(artists: list[PlaylistArtist], suggested_name: str) -> 
     if len(clear_matches) == 1:
         return clear_matches[0]
     return None
+
+
+def _match_from_exact_anchor(event: EventRow, artist: PlaylistArtist) -> MatchResult:
+    return MatchResult(
+        index=0,
+        date_text=event.date_text,
+        date_display=format_date_for_display(event.date_text),
+        performer=clean_name(event.performer),
+        venue=event.venue,
+        artist_name=artist.name,
+        playlist_song_count=artist.song_count,
+        sample_songs=artist.sample_songs[:5],
+        confidence="\u9ad8",
+        score=1.0,
+        match_method="\u7cbe\u786e\u540d\u79f0\u951a\u5b9a",
+        matched_alias=clean_name(event.performer),
+        image_name=event.image_name,
+    )
 
 
 def _match_from_ai_suggestion(event: EventRow, artist: PlaylistArtist, suggestion, label: str) -> MatchResult:

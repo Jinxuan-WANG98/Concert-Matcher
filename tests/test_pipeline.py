@@ -63,7 +63,7 @@ class PipelineTest(unittest.TestCase):
         class PartialReviewer:
             last_failures = [RuntimeError("one required batch failed")]
 
-            def find_best_matches(self, events, artists):
+            def find_best_matches(self, events, artists, event_indices=None):
                 return {
                     0: AiMatchSuggestion(
                         artist_name="PREP",
@@ -82,6 +82,25 @@ class PipelineTest(unittest.TestCase):
             )
 
         self.assertEqual(warnings, [])
+
+    def test_safe_ai_reviewer_forwards_original_event_indices(self):
+        class CapturingReviewer:
+            last_failures = []
+
+            def find_best_matches(self, events, artists, event_indices=None):
+                self.event_indices = event_indices
+                return {}
+
+        inner = CapturingReviewer()
+        reviewer = pipeline._SafeAiReviewer(inner, [], strict=True)
+
+        reviewer.find_best_matches(
+            [EventRow(date_text="9.12", performer="VoX LoW", venue="星在")],
+            [PlaylistArtist(name="VOX LOW", song_count=1, sample_songs=[])],
+            event_indices=[116],
+        )
+
+        self.assertEqual(inner.event_indices, [116])
 
     def test_pipeline_matches_and_exports_required_columns(self):
         artists = [

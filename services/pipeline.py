@@ -84,11 +84,20 @@ class _SafeAiReviewer:
             self._warn_once(exc)
             return None
 
-    def find_best_matches(self, events: list[EventRow], artists: list[PlaylistArtist]):
+    def find_best_matches(
+        self,
+        events: list[EventRow],
+        artists: list[PlaylistArtist],
+        event_indices: list[int] | None = None,
+    ):
         if not hasattr(self._reviewer, "find_best_matches"):
             return {}
         try:
-            suggestions = self._reviewer.find_best_matches(events, artists)
+            suggestions = self._reviewer.find_best_matches(
+                events,
+                artists,
+                event_indices=event_indices,
+            )
             failures = getattr(self._reviewer, "last_failures", [])
             if failures:
                 if self._strict:
