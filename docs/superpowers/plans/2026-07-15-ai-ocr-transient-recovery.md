@@ -12,7 +12,7 @@
 
 - Keep OCR at one image per batch and three parallel initial image workers.
 - Keep the 90-second individual provider timeout.
-- Permit exactly one retry only for a combined transient provider failure; do not retry malformed, forbidden, or empty-result failures.
+- Permit exactly one retry for at most one combined transient provider failure per task; do not retry malformed, forbidden, or empty-result failures.
 - Never render or return matches unless every required OCR batch and later AI analysis has completed.
 - Do not add dependencies or increase normal-path memory use.
 
@@ -89,7 +89,7 @@ def _is_transient_ocr_error(error: str) -> bool:
 - [ ] **Step 2: Recover only failed transient batches after the executor closes**
 
 ```python
-for batch_index in list(failed_batches):
+for batch_index in list(failed_batches)[:1]:
     if not _is_transient_ocr_error(error_by_batch[batch_index]):
         continue
     for attempt in range(config.transient_retry_attempts):
