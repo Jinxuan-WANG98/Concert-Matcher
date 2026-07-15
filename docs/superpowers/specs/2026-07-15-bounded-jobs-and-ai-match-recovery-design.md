@@ -25,7 +25,7 @@ One production job has observed a process-memory peak of about 136 MiB.  Two con
 
 The browser will treat a refresh as abandoning its own remembered job.  On `pagehide`, it sends a best-effort `POST /api/jobs/<id>/cancel` with `keepalive`; on a subsequent page load, it repeats that request if a remembered id remains, clears local storage, enables the form, and states that the old task returned no result.
 
-The cancel endpoint changes only an active job to `cancelled`, removes any result, and persists the snapshot.  A cancelled job never later transitions to `succeeded` or exposes its eventual background result.  If it was still queued, its worker exits before beginning the pipeline.  If a provider call is already in progress, Python cannot safely interrupt it; the worker is discarded as soon as that call returns and remains counted against the two-job ceiling in the meantime.
+The cancel endpoint changes only an active job to `cancelled`, removes any result, and persists the snapshot.  A cancelled job never later transitions to `succeeded` or exposes its eventual background result.  If it was still queued, its worker exits before beginning the pipeline.  If a provider call is already in progress, Python cannot safely interrupt it; the next pipeline progress boundary raises a cancellation signal as soon as that blocking stage returns, so later OCR/matching/export stages do not start.  The worker remains counted against the two-job ceiling until it exits.
 
 This implements the user-visible requirement to terminate the old submission without risking unsafe thread termination or memory oversubscription.
 

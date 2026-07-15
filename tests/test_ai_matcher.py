@@ -71,9 +71,10 @@ class AiMatcherTest(unittest.TestCase):
         config = AiMatchConfig()
 
         self.assertEqual(config.candidate_limit, 200)
+        self.assertEqual(config.timeout_seconds, 90)
         self.assertEqual(config.event_batch_size, 40)
         self.assertEqual(config.event_workers, 2)
-        self.assertEqual(config.max_calls, 20)
+        self.assertEqual(config.max_calls, 30)
         self.assertEqual(config.max_elapsed_seconds, 600)
 
     def test_config_loads_call_and_elapsed_budgets(self):
@@ -465,7 +466,7 @@ class AiMatcherTest(unittest.TestCase):
 
         self.assertEqual(payloads[0]["playlist_candidates"], [{"name": "PREP"}])
 
-    def test_call_budget_stops_recursive_timeout_splits(self):
+    def test_timeout_candidate_split_stops_after_one_recovery_level(self):
         config = AiMatchConfig(
             enabled=True,
             api_key="test-key",
@@ -491,10 +492,43 @@ class AiMatcherTest(unittest.TestCase):
             for index in range(4)
         ]
 
-        with self.assertRaisesRegex(RuntimeError, "调用次数上限"):
+        with self.assertRaisesRegex(TimeoutError, "timed out"):
             reviewer.find_best_matches(events, artists)
 
         self.assertEqual(len(calls), 2)
+
+    def test_timeout_event_batch_splits_once_without_recursive_fanout(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+            candidate_limit=10,
+            event_batch_size=4,
+            event_workers=1,
+            max_calls=30,
+            max_elapsed_seconds=600,
+        )
+        reviewer = AiArtistReviewer(config)
+        call_sizes = []
+
+        def timeout(payload):
+            content = payload["messages"][-1]["content"]
+            body = json.loads(content.split("JSON:\n", 1)[1])
+            call_sizes.append(len(body["events"]))
+            raise TimeoutError("The read operation timed out")
+
+        reviewer._chat_content = timeout
+        events = [
+            EventRow(date_text=f"8.{index + 1}", performer=f"Artist {index}", venue="MAO")
+            for index in range(4)
+        ]
+        artists = [PlaylistArtist(name="Artist 0", song_count=1, sample_songs=[])]
+
+        with self.assertRaisesRegex(TimeoutError, "timed out"):
+            reviewer.find_best_matches(events, artists)
+
+        self.assertEqual(call_sizes, [4, 2])
 
     def test_terminal_single_event_single_artist_timeout_is_not_treated_as_no_match(self):
         config = AiMatchConfig(

@@ -30,7 +30,7 @@
 **Files:** `services/job_manager.py`, `app.py`, `static/app.js`, `.env.example`, `render.yaml`
 
 1. Introduce `max_concurrent_jobs`, executing-job tracking, capacity-only `JobBusyError`, and a persisted `cancel` transition.
-2. Ensure `_run`, success, and failure preserve a cancelled snapshot and release the executing slot in `finally`.
+2. Ensure `_run`, success, and failure preserve a cancelled snapshot, make the next progress callback stop a cancelled pipeline after its current blocking stage, and release the executing slot in `finally`.
 3. Remove the global preflight busy check, add the cancel route, and return generic capacity text.
 4. On browser page hide, best-effort cancel the active id.  On load, cancel/clear any remembered id and enable a fresh submission.  Handle `cancelled` as a terminal no-result state.
 5. Set `JOB_MAX_CONCURRENT=2` in checked configuration sources.

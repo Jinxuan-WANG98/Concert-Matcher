@@ -145,7 +145,7 @@ class AppRoutesTest(unittest.TestCase):
         self.assertEqual(succeeded["result"]["matches"][0]["artist"], "PREP")
         self.assertEqual(succeeded["result"]["download_url"], f"/download/{job_id}")
 
-    def test_match_endpoint_rejects_concurrent_requests(self):
+    def test_match_endpoint_allows_two_users_and_rejects_a_third(self):
         started = threading.Event()
         release = threading.Event()
         first_response = {}
@@ -179,13 +179,53 @@ class AppRoutesTest(unittest.TestCase):
                     "xhs_url": "https://www.xiaohongshu.com/explore/1",
                 },
             )
-            self.assertEqual(busy.status_code, 409)
-            self.assertIn("进行中", busy.json["error"])
+            self.assertEqual(busy.status_code, 202)
+            third = self.client.post(
+                "/api/match",
+                data={
+                    "netease_url": "https://music.163.com/#/playlist?id=3",
+                    "xhs_url": "https://www.xiaohongshu.com/explore/3",
+                },
+            )
+            self.assertEqual(third.status_code, 409)
+            self.assertIn("容量", third.json["error"])
             self.assertNotIn("active_job_id", busy.json)
         finally:
             release.set()
             first.join(timeout=3)
         self.assertEqual(first_response["response"].status_code, 202)
+
+    def test_cancel_endpoint_marks_own_job_cancelled_without_a_result(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_pipeline(*args, **kwargs):
+            started.set()
+            release.wait(timeout=2)
+            return PipelineResult(matches=[], playlist_artist_count=0, event_count=0, warnings=[])
+
+        app.run_match_pipeline = slow_pipeline
+        created = self.client.post(
+            "/api/match",
+            data={
+                "netease_url": "https://music.163.com/#/playlist?id=1",
+                "xhs_url": "https://www.xiaohongshu.com/explore/1",
+            },
+        )
+        self.assertEqual(created.status_code, 202)
+        self.assertTrue(started.wait(timeout=1))
+        job_id = created.json["job_id"]
+
+        cancelled = self.client.post(f"/api/jobs/{job_id}/cancel")
+        self.assertEqual(cancelled.status_code, 200)
+        self.assertEqual(cancelled.json["state"], "cancelled")
+        self.assertNotIn("result", cancelled.json)
+
+        release.set()
+        time.sleep(0.05)
+        snapshot = self.client.get(f"/api/jobs/{job_id}")
+        self.assertEqual(snapshot.json["state"], "cancelled")
+        self.assertNotIn("result", snapshot.json)
 
     def test_match_endpoint_returns_clear_error_for_missing_playlist(self):
         response = self.client.post("/api/match", data={})
@@ -319,13 +359,17 @@ class AppRoutesTest(unittest.TestCase):
         self.assertNotIn("renderResults(data);", js)
         self.assertNotIn("setInterval(refreshMatchStatus", js)
 
-    def test_frontend_resumes_stored_job_without_discovering_another_users_job(self):
+    def test_frontend_abandons_stored_job_without_discovering_another_users_job(self):
         js = Path("static/app.js").read_text(encoding="utf-8")
 
         self.assertIn("resumeStoredJob", js)
         self.assertIn("scheduleJobPoll", js)
+        self.assertIn("function cancelJob", js)
+        self.assertIn('window.addEventListener("pagehide"', js)
+        self.assertIn("await cancelJob(storedJobId)", js)
         self.assertIn("setSubmitting(false)", js)
         self.assertIn("clearActiveJob", js)
+        self.assertNotIn("await pollJob(storedJobId)", js)
         self.assertNotIn('fetch("/api/status"', js)
         self.assertNotIn("response.status === 409 && data.active_job_id", js)
 
@@ -335,6 +379,7 @@ class AppRoutesTest(unittest.TestCase):
         self.assertIn("function failActiveJob", js)
         self.assertIn('failActiveJob("任务已完成，但服务器没有返回最终结果。请重新提交。")', js)
         self.assertIn("failActiveJob(data.error || copy.failed)", js)
+        self.assertIn('data.state === "cancelled"', js)
 
     def test_frontend_explains_interrupted_remembered_job(self):
         js = Path("static/app.js").read_text(encoding="utf-8")

@@ -74,26 +74,80 @@ class MatchJobManagerTest(unittest.TestCase):
             manager.start("c" * 32, lambda progress: {"matches": []})
             self.assertEqual(wait_for_state(manager, "c" * 32, "succeeded")["state"], "succeeded")
 
-    def test_rejects_a_second_job_while_one_is_running(self):
+    def test_allows_two_jobs_but_rejects_a_third_while_both_are_running(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            manager = MatchJobManager(root / "jobs", root, ttl_seconds=3600)
+            manager = MatchJobManager(root / "jobs", root, ttl_seconds=3600, max_concurrent_jobs=2)
             started = threading.Event()
             release = threading.Event()
+            start_count = 0
+            count_lock = threading.Lock()
 
             def slow(progress):
-                started.set()
+                nonlocal start_count
+                with count_lock:
+                    start_count += 1
+                    if start_count == 2:
+                        started.set()
                 release.wait(timeout=2)
                 return {"matches": []}
 
             manager.start("d" * 32, slow)
+            manager.start("e" * 32, slow)
             self.assertTrue(started.wait(timeout=1))
             with self.assertRaises(JobBusyError) as context:
-                manager.start("e" * 32, lambda progress: {"matches": []})
-            self.assertEqual(context.exception.active_job_id, "d" * 32)
+                manager.start("f" * 32, lambda progress: {"matches": []})
+            self.assertEqual(context.exception.active_job_count, 2)
+            self.assertEqual(context.exception.max_concurrent_jobs, 2)
             self.assertTrue(manager.is_busy())
             release.set()
             wait_for_state(manager, "d" * 32, "succeeded")
+            wait_for_state(manager, "e" * 32, "succeeded")
+
+    def test_cancel_hides_result_and_retains_execution_slot_until_worker_exits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = MatchJobManager(root / "jobs", root, ttl_seconds=3600, max_concurrent_jobs=2)
+            first_started = threading.Event()
+            second_started = threading.Event()
+            continued_after_cancel = threading.Event()
+            release = threading.Event()
+
+            def slow_first(progress):
+                first_started.set()
+                release.wait(timeout=2)
+                progress("ai_match", 65, "must not continue after cancellation")
+                continued_after_cancel.set()
+                return {"matches": [{"artist": "must stay hidden"}]}
+
+            def slow_second(progress):
+                second_started.set()
+                release.wait(timeout=2)
+                return {"matches": []}
+
+            first_id = "a" * 32
+            second_id = "b" * 32
+            manager.start(first_id, slow_first)
+            self.assertTrue(first_started.wait(timeout=1))
+
+            cancelled = manager.cancel(first_id)
+            self.assertEqual(cancelled["state"], "cancelled")
+            self.assertNotIn("result", cancelled)
+
+            manager.start(second_id, slow_second)
+            self.assertTrue(second_started.wait(timeout=1))
+            with self.assertRaises(JobBusyError):
+                manager.start("c" * 32, lambda progress: {"matches": []})
+
+            release.set()
+            wait_for_state(manager, second_id, "succeeded")
+            self.assertEqual(manager.get(first_id)["state"], "cancelled")
+            self.assertNotIn("result", manager.get(first_id))
+            self.assertFalse(continued_after_cancel.is_set())
+            deadline = time.monotonic() + 1
+            while manager.is_busy() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(manager.is_busy())
 
     def test_cleanup_removes_only_expired_hex_job_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:

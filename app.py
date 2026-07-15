@@ -50,6 +50,7 @@ _job_manager = MatchJobManager(
     OUTPUT_ROOT / "jobs",
     OUTPUT_ROOT,
     ttl_seconds=int(os.environ.get("JOB_TTL_SECONDS", "86400")),
+    max_concurrent_jobs=int(os.environ.get("JOB_MAX_CONCURRENT", "2")),
 )
 
 
@@ -76,6 +77,14 @@ def api_job(job_id: str):
     return jsonify(snapshot)
 
 
+@app.post("/api/jobs/<job_id>/cancel")
+def api_cancel_job(job_id: str):
+    snapshot = _job_manager.cancel(job_id)
+    if snapshot is None:
+        return jsonify({"error": "任务不存在或已过期"}), 404
+    return jsonify(snapshot)
+
+
 @app.post("/api/match")
 def api_match():
     netease_url = (request.form.get("netease_url") or "").strip()
@@ -88,9 +97,6 @@ def api_match():
 
     if not netease_url:
         return jsonify({"error": "请填写网易云歌单链接"}), 400
-
-    if _job_manager.is_busy():
-        return jsonify({"error": "已有匹配任务在进行中，请等待完成后再试"}), 409
 
     job_id = uuid.uuid4().hex
     upload_dir = OUTPUT_ROOT / job_id / "uploads"
@@ -159,11 +165,11 @@ def api_match():
         debug_log(
             "app.py:api_match",
             "match request rejected busy",
-            {"activeJobId": exc.active_job_id},
+            {"activeJobCount": exc.active_job_count, "maxConcurrentJobs": exc.max_concurrent_jobs},
             hypothesis_id="H8",
         )
         return (
-            jsonify({"error": "已有匹配任务在进行中，请等待完成后再试"}),
+            jsonify({"error": "当前匹配容量已满，请稍后再试。"}),
             409,
         )
 

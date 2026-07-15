@@ -40,12 +40,12 @@ class AiMatchConfig:
     api_key: str = ""
     base_url: str = "https://api.openai.com/v1"
     model: str = "gpt-4.1-mini"
-    timeout_seconds: int = 20
+    timeout_seconds: int = 90
     candidate_limit: int = 200
     mode: str = "review"
     event_batch_size: int = 40
     event_workers: int = 2
-    max_calls: int = 20
+    max_calls: int = 30
     max_elapsed_seconds: int = 600
 
     @classmethod
@@ -71,12 +71,12 @@ class AiMatchConfig:
             api_key=api_key,
             base_url=base_url.rstrip("/"),
             model=os.environ.get("AI_MATCH_MODEL", "gpt-4.1-mini"),
-            timeout_seconds=int(os.environ.get("AI_MATCH_TIMEOUT_SECONDS", "20")),
+            timeout_seconds=int(os.environ.get("AI_MATCH_TIMEOUT_SECONDS", "90")),
             candidate_limit=max(1, int(os.environ.get("AI_MATCH_CANDIDATE_LIMIT", "200"))),
             mode=mode,
             event_batch_size=max(1, int(os.environ.get("AI_MATCH_EVENT_BATCH_SIZE", "40"))),
             event_workers=max(1, int(os.environ.get("AI_MATCH_EVENT_WORKERS", "2"))),
-            max_calls=max(1, int(os.environ.get("AI_MATCH_MAX_CALLS", "20"))),
+            max_calls=max(1, int(os.environ.get("AI_MATCH_MAX_CALLS", "30"))),
             max_elapsed_seconds=max(1, int(os.environ.get("AI_MATCH_MAX_ELAPSED_SECONDS", "600"))),
         )
 
@@ -828,6 +828,7 @@ class AiArtistReviewer:
         compact_candidates: bool = False,
         event_indices: list[int] | None = None,
         require_event_performer: bool = False,
+        timeout_split_depth: int = 0,
     ) -> dict[int, AiMatchSuggestion]:
         resolved_indices = _resolved_event_indices(events, start_index, event_indices)
         payload = build_batch_artist_pick_payload(
@@ -854,6 +855,8 @@ class AiArtistReviewer:
         except Exception as exc:
             if not _is_timeout_error(exc):
                 raise
+            if timeout_split_depth >= 1:
+                raise
             if len(events) <= 1:
                 if len(artists) <= 1:
                     raise
@@ -865,6 +868,7 @@ class AiArtistReviewer:
                     compact_candidates=compact_candidates,
                     event_indices=resolved_indices,
                     require_event_performer=require_event_performer,
+                    timeout_split_depth=timeout_split_depth + 1,
                 )
                 return _merge_suggestions(
                     suggestions,
@@ -875,6 +879,7 @@ class AiArtistReviewer:
                         compact_candidates=compact_candidates,
                         event_indices=resolved_indices,
                         require_event_performer=require_event_performer,
+                        timeout_split_depth=timeout_split_depth + 1,
                     ),
                 )
             midpoint = len(events) // 2
@@ -885,16 +890,18 @@ class AiArtistReviewer:
                 compact_candidates=compact_candidates,
                 event_indices=resolved_indices[:midpoint],
                 require_event_performer=require_event_performer,
+                timeout_split_depth=timeout_split_depth + 1,
             )
             return _merge_suggestions(
                 suggestions,
                 self._find_best_matches_batch_for_candidates(
-                events[midpoint:],
-                artists,
-                start_index=resolved_indices[midpoint],
-                compact_candidates=compact_candidates,
-                event_indices=resolved_indices[midpoint:],
-                require_event_performer=require_event_performer,
+                    events[midpoint:],
+                    artists,
+                    start_index=resolved_indices[midpoint],
+                    compact_candidates=compact_candidates,
+                    event_indices=resolved_indices[midpoint:],
+                    require_event_performer=require_event_performer,
+                    timeout_split_depth=timeout_split_depth + 1,
                 ),
             )
 

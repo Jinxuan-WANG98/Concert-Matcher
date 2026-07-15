@@ -20,6 +20,7 @@ const copy = {
   busy: "已有匹配任务在进行中。请保持页面打开，完成后会一次性显示最终结果。",
   start: "开始匹配",
   failed: "匹配失败，请稍后再试。",
+  cancelled: "此前提交的任务已取消，未返回结果。你可以重新提交。",
   networkFailed: "状态查询暂时中断，正在自动重试；任务 ID 已保留，请勿重复提交。",
   jobInterrupted: "服务已重启或任务记录已过期；本次未返回结果，请重新提交。",
   empty: "暂时没有匹配到近期演出。可以换一个演出整理链接，或上传更清晰的图片。",
@@ -165,6 +166,18 @@ function failActiveJob(message) {
   setSubmitting(false);
 }
 
+async function cancelJob(jobId) {
+  if (!jobId || window.location.protocol === "file:") return;
+  try {
+    await fetch(`/api/jobs/${jobId}/cancel`, {
+      method: "POST",
+      keepalive: true,
+    });
+  } catch (error) {
+    // A page unload can interrupt the best-effort cancellation request.
+  }
+}
+
 function scheduleJobPoll(jobId, delay = pollIntervalMs) {
   if (pollTimer) {
     window.clearTimeout(pollTimer);
@@ -215,6 +228,11 @@ async function pollJob(jobId) {
       return;
     }
 
+    if (data.state === "cancelled") {
+      failActiveJob(data.error || copy.cancelled);
+      return;
+    }
+
     showStatus(progressMessage(data));
     setSubmitting(true);
     shouldContinue = true;
@@ -242,13 +260,18 @@ async function resumeStoredJob() {
     storedJobId = null;
   }
   if (storedJobId) {
-    rememberJob(storedJobId);
-    setSubmitting(true);
-    await pollJob(storedJobId);
-    return;
+    await cancelJob(storedJobId);
+    clearActiveJob();
+    showStatus(copy.cancelled, true);
   }
   setSubmitting(false);
 }
+
+window.addEventListener("pagehide", () => {
+  if (activeJobId) {
+    void cancelJob(activeJobId);
+  }
+});
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();

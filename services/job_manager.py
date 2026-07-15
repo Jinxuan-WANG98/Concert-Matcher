@@ -15,19 +15,31 @@ _JOB_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
 
 class JobBusyError(RuntimeError):
-    def __init__(self, active_job_id: str):
-        super().__init__("a match job is already running")
-        self.active_job_id = active_job_id
+    def __init__(self, active_job_count: int, max_concurrent_jobs: int):
+        super().__init__("match job capacity is full")
+        self.active_job_count = active_job_count
+        self.max_concurrent_jobs = max_concurrent_jobs
+
+
+class JobCancelledError(RuntimeError):
+    pass
 
 
 class MatchJobManager:
-    def __init__(self, state_dir: Path, artifact_root: Path, ttl_seconds: int = 86400):
+    def __init__(
+        self,
+        state_dir: Path,
+        artifact_root: Path,
+        ttl_seconds: int = 86400,
+        max_concurrent_jobs: int = 2,
+    ):
         self.state_dir = Path(state_dir)
         self.artifact_root = Path(artifact_root)
         self.ttl_seconds = max(1, int(ttl_seconds))
+        self.max_concurrent_jobs = max(1, int(max_concurrent_jobs))
         self._lock = threading.RLock()
         self._jobs: dict[str, dict] = {}
-        self._active_job_id: str | None = None
+        self._executing_job_ids: set[str] = set()
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.artifact_root.mkdir(parents=True, exist_ok=True)
         self.cleanup_expired()
@@ -39,11 +51,9 @@ class MatchJobManager:
         self.cleanup_expired()
         now = _utc_now()
         with self._lock:
-            if self._active_job_id:
-                active = self._jobs.get(self._active_job_id)
-                if active and active.get("state") in _ACTIVE_STATES:
-                    raise JobBusyError(self._active_job_id)
-                self._active_job_id = None
+            active_job_count = len(self._executing_job_ids)
+            if active_job_count >= self.max_concurrent_jobs:
+                raise JobBusyError(active_job_count, self.max_concurrent_jobs)
             snapshot = {
                 "job_id": job_id,
                 "state": "queued",
@@ -54,7 +64,7 @@ class MatchJobManager:
                 "updated_at": now,
             }
             self._jobs[job_id] = snapshot
-            self._active_job_id = job_id
+            self._executing_job_ids.add(job_id)
             self._persist_locked(snapshot)
             created = dict(snapshot)
 
@@ -79,6 +89,28 @@ class MatchJobManager:
                     self._jobs[job_id] = snapshot
             return dict(snapshot) if snapshot is not None else None
 
+    def cancel(self, job_id: str) -> dict | None:
+        if not _JOB_ID_PATTERN.fullmatch(job_id):
+            return None
+        with self._lock:
+            snapshot = self._jobs.get(job_id)
+            if snapshot is None:
+                snapshot = self._read_state(job_id)
+                if snapshot is None:
+                    return None
+                self._jobs[job_id] = snapshot
+            if snapshot.get("state") in _ACTIVE_STATES:
+                snapshot.update(
+                    state="cancelled",
+                    stage="cancelled",
+                    message="任务已取消",
+                    error="任务已取消，未返回结果。",
+                    updated_at=_utc_now(),
+                )
+                snapshot.pop("result", None)
+                self._persist_locked(snapshot)
+            return dict(snapshot)
+
     def latest(self) -> dict | None:
         self.cleanup_expired()
         with self._lock:
@@ -92,19 +124,15 @@ class MatchJobManager:
 
     def is_busy(self) -> bool:
         with self._lock:
-            if not self._active_job_id:
-                return False
-            active = self._jobs.get(self._active_job_id)
-            return bool(active and active.get("state") in _ACTIVE_STATES)
+            return bool(self._executing_job_ids)
 
     def cleanup_expired(self) -> None:
         cutoff = time.time() - self.ttl_seconds
         root = self.artifact_root.resolve()
         with self._lock:
-            active_job_id = self._active_job_id
             for state_path in self.state_dir.glob("*.json"):
                 job_id = state_path.stem
-                if job_id == active_job_id or not _JOB_ID_PATTERN.fullmatch(job_id):
+                if job_id in self._executing_job_ids or not _JOB_ID_PATTERN.fullmatch(job_id):
                     continue
                 try:
                     expired = state_path.stat().st_mtime < cutoff
@@ -119,29 +147,44 @@ class MatchJobManager:
                     shutil.rmtree(artifact_path)
 
     def _run(self, job_id: str, operation) -> None:
-        self._update(job_id, state="running", stage="starting", progress=1, message="任务正在启动")
-
-        def report_progress(stage: str, progress: int, message: str) -> None:
-            self._update(
-                job_id,
-                state="running",
-                stage=str(stage),
-                progress=max(1, min(99, int(progress))),
-                message=str(message),
-            )
-
         try:
-            result = operation(report_progress)
-        except Exception as exc:
-            self._finish_failed(job_id, str(exc) or exc.__class__.__name__)
-            return
-        self._finish_succeeded(job_id, result)
+            self._update(job_id, state="running", stage="starting", progress=1, message="任务正在启动")
+            if self._is_cancelled(job_id):
+                return
 
-    def _update(self, job_id: str, **changes) -> None:
+            def report_progress(stage: str, progress: int, message: str) -> None:
+                updated = self._update(
+                    job_id,
+                    state="running",
+                    stage=str(stage),
+                    progress=max(1, min(99, int(progress))),
+                    message=str(message),
+                )
+                if not updated:
+                    raise JobCancelledError()
+
+            try:
+                result = operation(report_progress)
+            except JobCancelledError:
+                return
+            except Exception as exc:
+                self._finish_failed(job_id, str(exc) or exc.__class__.__name__)
+                return
+            self._finish_succeeded(job_id, result)
+        finally:
+            with self._lock:
+                self._executing_job_ids.discard(job_id)
+
+    def _is_cancelled(self, job_id: str) -> bool:
+        with self._lock:
+            snapshot = self._jobs.get(job_id)
+            return bool(snapshot and snapshot.get("state") == "cancelled")
+
+    def _update(self, job_id: str, **changes) -> bool:
         with self._lock:
             snapshot = self._jobs[job_id]
             if snapshot.get("state") not in _ACTIVE_STATES:
-                return
+                return False
             if "progress" in changes:
                 changes["progress"] = max(int(snapshot.get("progress", 0)), int(changes["progress"]))
             snapshot.update(changes)
@@ -149,10 +192,13 @@ class MatchJobManager:
             snapshot.pop("result", None)
             snapshot.pop("error", None)
             self._persist_locked(snapshot)
+            return True
 
     def _finish_succeeded(self, job_id: str, result: dict) -> None:
         with self._lock:
             snapshot = self._jobs[job_id]
+            if snapshot.get("state") == "cancelled":
+                return
             snapshot.update(
                 state="succeeded",
                 stage="completed",
@@ -163,12 +209,12 @@ class MatchJobManager:
             )
             snapshot.pop("error", None)
             self._persist_locked(snapshot)
-            if self._active_job_id == job_id:
-                self._active_job_id = None
 
     def _finish_failed(self, job_id: str, error: str) -> None:
         with self._lock:
             snapshot = self._jobs[job_id]
+            if snapshot.get("state") == "cancelled":
+                return
             snapshot.update(
                 state="failed",
                 stage="failed",
@@ -178,8 +224,6 @@ class MatchJobManager:
             )
             snapshot.pop("result", None)
             self._persist_locked(snapshot)
-            if self._active_job_id == job_id:
-                self._active_job_id = None
 
     def _persist_locked(self, snapshot: dict) -> None:
         job_id = snapshot["job_id"]

@@ -20,6 +20,8 @@ services:
         value: "12000"
       - key: JOB_TTL_SECONDS
         value: "86400"
+      - key: JOB_MAX_CONCURRENT
+        value: "2"
       - key: OUTPUT_ROOT
         value: outputs/webapp
       - key: OCR_MAX_WORKERS
@@ -39,7 +41,7 @@ services:
       - key: AI_MATCH_MODE
         value: ai_only
       - key: AI_MATCH_TIMEOUT_SECONDS
-        value: "60"
+        value: "90"
       - key: AI_MATCH_CANDIDATE_LIMIT
         value: "200"
       - key: AI_MATCH_EVENT_BATCH_SIZE
@@ -47,7 +49,7 @@ services:
       - key: AI_MATCH_EVENT_WORKERS
         value: "2"
       - key: AI_MATCH_MAX_CALLS
-        value: "20"
+        value: "30"
       - key: AI_MATCH_MAX_ELAPSED_SECONDS
         value: "600"
       - key: AI_OCR_ENABLED
