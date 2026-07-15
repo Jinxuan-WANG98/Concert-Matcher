@@ -66,7 +66,7 @@ class AiMatcherTest(unittest.TestCase):
             model="text-model",
         )
 
-        self.assertTrue(config.cache_source.startswith("ai-match:v9:"))
+        self.assertTrue(config.cache_source.startswith("ai-match:v10:"))
 
     def test_config_defaults_bound_calls_and_use_two_workers(self):
         config = AiMatchConfig()
@@ -75,6 +75,7 @@ class AiMatcherTest(unittest.TestCase):
         self.assertEqual(config.timeout_seconds, 90)
         self.assertEqual(config.event_batch_size, 20)
         self.assertEqual(config.shortlist_per_event, 5)
+        self.assertEqual(config.minimum_candidate_tier, 4)
         self.assertEqual(config.event_workers, 2)
         self.assertEqual(config.max_calls, 30)
         self.assertEqual(config.max_elapsed_seconds, 600)
@@ -91,6 +92,19 @@ class AiMatcherTest(unittest.TestCase):
                 os.environ["AI_MATCH_SHORTLIST_PER_EVENT"] = old_value
 
         self.assertEqual(config.shortlist_per_event, 7)
+
+    def test_config_loads_minimum_candidate_tier(self):
+        old_value = os.environ.pop("AI_MATCH_MIN_CANDIDATE_TIER", None)
+        try:
+            os.environ["AI_MATCH_MIN_CANDIDATE_TIER"] = "3"
+            config = AiMatchConfig.from_env()
+        finally:
+            if old_value is None:
+                os.environ.pop("AI_MATCH_MIN_CANDIDATE_TIER", None)
+            else:
+                os.environ["AI_MATCH_MIN_CANDIDATE_TIER"] = old_value
+
+        self.assertEqual(config.minimum_candidate_tier, 3)
 
     def test_shortlists_prioritize_alias_and_ocr_equivalent_names(self):
         events = [
@@ -520,6 +534,110 @@ class AiMatcherTest(unittest.TestCase):
                 PlaylistArtist(name="Noise", song_count=1, sample_songs=[]),
             ],
             event_indices=[10, 11],
+        )
+
+        self.assertEqual(suggestions, {})
+
+    def test_reviewer_rejects_weak_shortlist_candidate_even_when_model_is_confident(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+            shortlist_per_event=1,
+            minimum_candidate_tier=2,
+            event_batch_size=1,
+            event_workers=1,
+        )
+        reviewer = AiArtistReviewer(config)
+        reviewer._chat_content = lambda _payload: json.dumps(
+            {
+                "matches": [
+                    {
+                        "event_index": 10,
+                        "event_performer": "Completely Different",
+                        "artist_name": "Alpha",
+                        "confidence": "高",
+                        "reason": "model forced a weak candidate",
+                    }
+                ]
+            }
+        )
+
+        suggestions = reviewer.find_best_matches(
+            [EventRow(date_text="9.01", performer="Completely Different", venue="MAO")],
+            [PlaylistArtist(name="Alpha", song_count=1, sample_songs=[])],
+            event_indices=[10],
+        )
+
+        self.assertEqual(suggestions, {})
+
+    def test_reviewer_accepts_containment_candidate_above_minimum_tier(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+            shortlist_per_event=1,
+            minimum_candidate_tier=2,
+            event_batch_size=1,
+            event_workers=1,
+        )
+        reviewer = AiArtistReviewer(config)
+        reviewer._chat_content = lambda _payload: json.dumps(
+            {
+                "matches": [
+                    {
+                        "event_index": 10,
+                        "event_performer": "歌之初",
+                        "artist_name": "歌之初乐队",
+                        "confidence": "高",
+                        "reason": "same artist with a suffix",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+        suggestions = reviewer.find_best_matches(
+            [EventRow(date_text="9.01", performer="歌之初", venue="MAO")],
+            [PlaylistArtist(name="歌之初乐队", song_count=1, sample_songs=[])],
+            event_indices=[10],
+        )
+
+        self.assertEqual(suggestions[10].artist_name, "歌之初乐队")
+
+    def test_reviewer_rejects_loose_short_substring_candidate(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+            shortlist_per_event=1,
+            minimum_candidate_tier=4,
+            event_batch_size=1,
+            event_workers=1,
+        )
+        reviewer = AiArtistReviewer(config)
+        reviewer._chat_content = lambda _payload: json.dumps(
+            {
+                "matches": [
+                    {
+                        "event_index": 10,
+                        "event_performer": "Andr",
+                        "artist_name": "Andrew Bird",
+                        "confidence": "高",
+                        "reason": "shared a short prefix",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+        suggestions = reviewer.find_best_matches(
+            [EventRow(date_text="9.01", performer="Andr", venue="MAO")],
+            [PlaylistArtist(name="Andrew Bird", song_count=1, sample_songs=[])],
+            event_indices=[10],
         )
 
         self.assertEqual(suggestions, {})

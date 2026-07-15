@@ -46,6 +46,8 @@ services:
         value: "200"
       - key: AI_MATCH_SHORTLIST_PER_EVENT
         value: "5"
+      - key: AI_MATCH_MIN_CANDIDATE_TIER
+        value: "4"
       - key: AI_MATCH_EVENT_BATCH_SIZE
         value: "20"
       - key: AI_MATCH_EVENT_WORKERS

@@ -41,6 +41,7 @@ class AiMatchConfig:
     timeout_seconds: int = 90
     candidate_limit: int = 200
     shortlist_per_event: int = 5
+    minimum_candidate_tier: int = 4
     mode: str = "review"
     event_batch_size: int = 20
     event_workers: int = 2
@@ -73,6 +74,9 @@ class AiMatchConfig:
             timeout_seconds=int(os.environ.get("AI_MATCH_TIMEOUT_SECONDS", "90")),
             candidate_limit=max(1, int(os.environ.get("AI_MATCH_CANDIDATE_LIMIT", "200"))),
             shortlist_per_event=max(1, int(os.environ.get("AI_MATCH_SHORTLIST_PER_EVENT", "5"))),
+            minimum_candidate_tier=max(
+                1, min(6, int(os.environ.get("AI_MATCH_MIN_CANDIDATE_TIER", "4")))
+            ),
             mode=mode,
             event_batch_size=max(1, int(os.environ.get("AI_MATCH_EVENT_BATCH_SIZE", "20"))),
             event_workers=max(1, int(os.environ.get("AI_MATCH_EVENT_WORKERS", "2"))),
@@ -83,8 +87,9 @@ class AiMatchConfig:
     @property
     def cache_source(self) -> str:
         return (
-            f"ai-match:v9:{self.base_url}:{self.model}:"
-            f"c{self.candidate_limit}:s{self.shortlist_per_event}:mode{self.mode}"
+            f"ai-match:v10:{self.base_url}:{self.model}:"
+            f"c{self.candidate_limit}:s{self.shortlist_per_event}:"
+            f"t{self.minimum_candidate_tier}:mode{self.mode}"
         )
 
 
@@ -93,8 +98,9 @@ def _bounded_spelling_similarity(left: str, right: str, max_distance: int = 2) -
         return 0.0
     if left == right:
         return 1.0
+    effective_max_distance = min(max_distance, 1 if min(len(left), len(right)) < 8 else max_distance)
     length_gap = abs(len(left) - len(right))
-    if length_gap > max_distance:
+    if length_gap > effective_max_distance:
         return 0.0
 
     if len(left) == len(right):
@@ -106,7 +112,7 @@ def _bounded_spelling_similarity(left: str, right: str, max_distance: int = 2) -
             and left[mismatches[1]] == right[mismatches[0]]
         ):
             return 1.0 - (1.0 / len(left))
-        if len(mismatches) > max_distance:
+        if len(mismatches) > effective_max_distance:
             return 0.0
         return 1.0 - (len(mismatches) / len(left))
 
@@ -121,12 +127,86 @@ def _bounded_spelling_similarity(left: str, right: str, max_distance: int = 2) -
             continue
         edits += 1
         long_index += 1
-        if edits > max_distance:
+        if edits > effective_max_distance:
             return 0.0
-    edits += len(longer) - long_index
-    if edits > max_distance:
+    edits += (len(longer) - long_index) + (len(shorter) - short_index)
+    if edits > effective_max_distance:
         return 0.0
     return 1.0 - (edits / len(longer))
+
+
+def _candidate_tokens(value: str) -> frozenset[str]:
+    return frozenset(
+        part for part in re.findall(r"[a-z0-9\u4e00-\u9fff]+", value.casefold()) if part != "and"
+    )
+
+
+def _candidate_ngrams(value: str) -> frozenset[str]:
+    if len(value) <= 2:
+        return frozenset({value}) if value else frozenset()
+    return frozenset(value[index : index + 2] for index in range(len(value) - 1))
+
+
+def _candidate_text_features(value: str) -> tuple[str, str, frozenset[str], frozenset[str]]:
+    from services.matcher import normalize_name, normalize_ocr_latin
+
+    key = normalize_name(value)
+    return key, normalize_ocr_latin(value), _candidate_tokens(value), _candidate_ngrams(key)
+
+
+def _candidate_relevance_from_features(
+    alias_features: list[tuple[str, str, frozenset[str], frozenset[str]]],
+    artist_features: tuple[str, str, frozenset[str], frozenset[str]],
+) -> tuple[int, float]:
+    artist_key, artist_ocr_key, artist_tokens, artist_ngrams = artist_features
+    best_tier = 0
+    best_score = 0.0
+    for alias_key, alias_ocr_key, alias_tokens, alias_ngrams in alias_features:
+        if alias_key and alias_key == artist_key:
+            tier, score = 6, 1.0
+        elif alias_ocr_key and len(alias_ocr_key) >= 4 and alias_ocr_key == artist_ocr_key:
+            tier, score = 5, 1.0
+        elif (
+            alias_key
+            and artist_key
+            and (alias_key in artist_key or artist_key in alias_key)
+            and min(len(alias_key), len(artist_key)) / max(len(alias_key), len(artist_key)) >= 0.6
+        ):
+            shorter = min(len(alias_key), len(artist_key))
+            longer = max(len(alias_key), len(artist_key))
+            tier, score = 4, shorter / longer
+        elif alias_tokens and artist_tokens and (
+            alias_tokens.issubset(artist_tokens) or artist_tokens.issubset(alias_tokens)
+        ):
+            tier = 3
+            score = min(len(alias_tokens), len(artist_tokens)) / max(
+                len(alias_tokens), len(artist_tokens)
+            )
+        else:
+            spelling_score = max(
+                _bounded_spelling_similarity(alias_key, artist_key),
+                _bounded_spelling_similarity(alias_ocr_key, artist_ocr_key),
+            )
+            if spelling_score > 0:
+                tier, score = 2, spelling_score
+            else:
+                union = alias_ngrams | artist_ngrams
+                tier = 1
+                score = len(alias_ngrams & artist_ngrams) / len(union) if union else 0.0
+        if (tier, score) > (best_tier, best_score):
+            best_tier, best_score = tier, score
+    return best_tier, best_score
+
+
+def _candidate_relevance_tier(event_performer: str, artist_name: str) -> int:
+    from services.matcher import event_aliases
+
+    alias_features = [_candidate_text_features(alias.value) for alias in event_aliases(event_performer)]
+    tier, _score = _candidate_relevance_from_features(
+        alias_features,
+        _candidate_text_features(artist_name),
+    )
+    return tier
 
 
 def build_event_candidate_shortlists(
@@ -138,66 +218,24 @@ def build_event_candidate_shortlists(
     """Return a deterministic, high-recall lexical shortlist for every event."""
     resolved_indices = _resolved_event_indices(events, 0, event_indices)
     limit = max(1, per_event_limit)
-    from services.matcher import event_aliases, normalize_name, normalize_ocr_latin
-
-    def tokens(value: str) -> frozenset[str]:
-        return frozenset(
-            part for part in re.findall(r"[a-z0-9\u4e00-\u9fff]+", value.casefold()) if part != "and"
-        )
-
-    def ngrams(value: str) -> frozenset[str]:
-        if len(value) <= 2:
-            return frozenset({value}) if value else frozenset()
-        return frozenset(value[index : index + 2] for index in range(len(value) - 1))
+    from services.matcher import event_aliases
 
     artist_features = []
     for artist in artists:
-        key = normalize_name(artist.name)
-        ocr_key = normalize_ocr_latin(artist.name)
-        artist_features.append((artist, key, ocr_key, tokens(artist.name.casefold()), ngrams(key)))
+        artist_features.append((artist, *_candidate_text_features(artist.name)))
 
     shortlists: dict[int, list[PlaylistArtist]] = {}
     for event_index, event in zip(resolved_indices, events):
         alias_features = []
         for alias in event_aliases(event.performer):
-            key = normalize_name(alias.value)
-            alias_features.append(
-                (key, normalize_ocr_latin(alias.value), tokens(alias.value.casefold()), ngrams(key))
-            )
+            alias_features.append(_candidate_text_features(alias.value))
 
         def rank(feature) -> tuple[int, float, str, str]:
             artist, artist_key, artist_ocr_key, artist_tokens, artist_ngrams = feature
-            best_tier = 0
-            best_score = 0.0
-            for alias_key, alias_ocr_key, alias_tokens, alias_ngrams in alias_features:
-                if alias_key and alias_key == artist_key:
-                    tier, score = 6, 1.0
-                elif alias_ocr_key and len(alias_ocr_key) >= 4 and alias_ocr_key == artist_ocr_key:
-                    tier, score = 5, 1.0
-                elif alias_key and artist_key and (alias_key in artist_key or artist_key in alias_key):
-                    shorter = min(len(alias_key), len(artist_key))
-                    longer = max(len(alias_key), len(artist_key))
-                    tier, score = 4, shorter / longer
-                elif alias_tokens and artist_tokens and (
-                    alias_tokens.issubset(artist_tokens) or artist_tokens.issubset(alias_tokens)
-                ):
-                    tier = 3
-                    score = min(len(alias_tokens), len(artist_tokens)) / max(
-                        len(alias_tokens), len(artist_tokens)
-                    )
-                else:
-                    spelling_score = max(
-                        _bounded_spelling_similarity(alias_key, artist_key),
-                        _bounded_spelling_similarity(alias_ocr_key, artist_ocr_key),
-                    )
-                    if spelling_score > 0:
-                        tier, score = 2, spelling_score
-                    else:
-                        union = alias_ngrams | artist_ngrams
-                        tier = 1
-                        score = len(alias_ngrams & artist_ngrams) / len(union) if union else 0.0
-                if (tier, score) > (best_tier, best_score):
-                    best_tier, best_score = tier, score
+            best_tier, best_score = _candidate_relevance_from_features(
+                alias_features,
+                (artist_key, artist_ocr_key, artist_tokens, artist_ngrams),
+            )
             return (-best_tier, -best_score, artist_key, artist.name.casefold())
 
         shortlists[event_index] = [feature[0] for feature in sorted(artist_features, key=rank)[:limit]]
@@ -657,6 +695,7 @@ def _validate_batch_suggestions(
     event_indices: list[int],
     require_event_performer: bool,
     candidate_names_by_event_index: dict[int, list[str]] | None = None,
+    minimum_candidate_tier: int = 0,
 ) -> dict[int, AiMatchSuggestion]:
     events_by_index = dict(zip(event_indices, events))
     accepted: dict[int, AiMatchSuggestion] = {}
@@ -695,6 +734,20 @@ def _validate_batch_suggestions(
                     hypothesis_id="H9",
                 )
                 continue
+        candidate_tier = _candidate_relevance_tier(event.performer, suggestion.artist_name)
+        if candidate_tier < minimum_candidate_tier:
+            debug_log(
+                "ai_matcher.py:_validate_batch_suggestions",
+                "ignored ai match below local relevance threshold",
+                {
+                    "eventIndex": event_index,
+                    "artistName": suggestion.artist_name,
+                    "candidateTier": candidate_tier,
+                    "minimumTier": minimum_candidate_tier,
+                },
+                hypothesis_id="H10",
+            )
+            continue
         accepted[event_index] = suggestion
     return accepted
 
@@ -911,6 +964,7 @@ class AiArtistReviewer:
                 resolved_indices,
                 require_event_performer,
                 candidate_names_by_event_index,
+                self.config.minimum_candidate_tier,
             )
         except Exception as exc:
             if not _is_timeout_error(exc):

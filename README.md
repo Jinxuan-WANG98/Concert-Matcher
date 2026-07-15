@@ -47,6 +47,7 @@ AI_MATCH_BASE_URL=https://api.openai.com/v1
 AI_MATCH_MODEL=gpt-4.1-mini
 AI_MATCH_CANDIDATE_LIMIT=200
 AI_MATCH_SHORTLIST_PER_EVENT=5
+AI_MATCH_MIN_CANDIDATE_TIER=4
 AI_MATCH_EVENT_BATCH_SIZE=20
 AI_MATCH_EVENT_WORKERS=2
 AI_MATCH_MAX_CALLS=30
@@ -55,7 +56,7 @@ AI_MATCH_MAX_ELAPSED_SECONDS=600
 
 `AI_MATCH_BASE_URL` can point to any OpenAI-compatible Chat Completions endpoint. AI review checks medium-confidence matches and can also fill a missing match when local rules find no candidate, but only from the playlist artists you provide.
 
-For AI-only matching, every unresolved event receives a deterministic local shortlist before AI review. Each request carries at most `AI_MATCH_EVENT_BATCH_SIZE` events and only `AI_MATCH_SHORTLIST_PER_EVENT` candidates for each event, so the model never receives the full playlist cross product. Timed-out requests can split once into smaller batches, but all requests—including repair and split calls—share `AI_MATCH_MAX_CALLS` and `AI_MATCH_MAX_ELAPSED_SECONDS`. If any required batch fails, the job fails and does not publish a partial result.
+For AI-only matching, every unresolved event receives a deterministic local shortlist before AI review. Each request carries at most `AI_MATCH_EVENT_BATCH_SIZE` events and only `AI_MATCH_SHORTLIST_PER_EVENT` candidates for each event, so the model never receives the full playlist cross product. AI suggestions below `AI_MATCH_MIN_CANDIDATE_TIER` are rejected server-side to prevent the model from forcing an unrelated shortlist candidate. Timed-out requests can split once into smaller batches, but all requests—including repair and split calls—share `AI_MATCH_MAX_CALLS` and `AI_MATCH_MAX_ELAPSED_SECONDS`. If any required batch fails, the job fails and does not publish a partial result.
 
 On the 512 MB Render instance, keep `WEB_CONCURRENCY=1`, `OCR_MAX_WORKERS=1`, `AI_OCR_IMAGE_BATCH_SIZE=1`, `AI_OCR_IMAGE_WORKERS=3`, `AI_MATCH_EVENT_WORKERS=2`, and `AI_OCR_LOCAL_FALLBACK=false`. Three concurrent worst-case 12-megapixel image encodes peaked at about 248 MB in local measurement; local RapidOCR can create a much larger peak and is intentionally disabled in the Blueprint.
 
