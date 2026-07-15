@@ -336,6 +336,14 @@ class AppRoutesTest(unittest.TestCase):
         self.assertIn('failActiveJob("任务已完成，但服务器没有返回最终结果。请重新提交。")', js)
         self.assertIn("failActiveJob(data.error || copy.failed)", js)
 
+    def test_frontend_explains_interrupted_remembered_job(self):
+        js = Path("static/app.js").read_text(encoding="utf-8")
+
+        self.assertIn("jobInterrupted", js)
+        self.assertIn("response.status === 404", js)
+        self.assertIn("failActiveJob(copy.jobInterrupted)", js)
+        self.assertNotIn("renderResults(copy.jobInterrupted)", js)
+
     def test_load_local_env_file_reads_values_without_overriding_existing_env(self):
         old_existing = os.environ.get("LOCAL_ENV_EXISTING")
         old_new = os.environ.pop("LOCAL_ENV_NEW", None)

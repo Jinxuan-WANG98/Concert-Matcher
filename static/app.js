@@ -21,6 +21,7 @@ const copy = {
   start: "开始匹配",
   failed: "匹配失败，请稍后再试。",
   networkFailed: "状态查询暂时中断，正在自动重试；任务 ID 已保留，请勿重复提交。",
+  jobInterrupted: "服务已重启或任务记录已过期；本次未返回结果，请重新提交。",
   empty: "暂时没有匹配到近期演出。可以换一个演出整理链接，或上传更清晰的图片。",
   fileMode: "你现在是直接打开 HTML 文件，这样只能看 UI，不能进行匹配。请先启动 Web App，然后打开 http://127.0.0.1:5050/ 。",
 };
@@ -191,8 +192,8 @@ async function pollJob(jobId) {
     const data = await parseJsonResponse(response);
     if (!response.ok) {
       if (response.status === 404) {
-        clearActiveJob();
-        setSubmitting(false);
+        failActiveJob(copy.jobInterrupted);
+        return;
       }
       throw new Error(data.error || copy.failed);
     }
