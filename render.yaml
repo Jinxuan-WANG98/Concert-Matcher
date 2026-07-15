@@ -44,8 +44,10 @@ services:
         value: "90"
       - key: AI_MATCH_CANDIDATE_LIMIT
         value: "200"
+      - key: AI_MATCH_SHORTLIST_PER_EVENT
+        value: "5"
       - key: AI_MATCH_EVENT_BATCH_SIZE
-        value: "40"
+        value: "20"
       - key: AI_MATCH_EVENT_WORKERS
         value: "2"
       - key: AI_MATCH_MAX_CALLS

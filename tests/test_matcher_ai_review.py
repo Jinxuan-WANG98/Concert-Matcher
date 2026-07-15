@@ -220,7 +220,7 @@ class MatcherAiReviewTest(unittest.TestCase):
         self.assertEqual(reviewer.find_calls, 0)
         self.assertEqual(reviewer.calls, 0)
 
-    def test_ai_only_mode_falls_back_to_single_match_when_batch_has_no_suggestion(self):
+    def test_ai_only_mode_does_not_repeat_single_match_after_complete_empty_batch(self):
         events = [EventRow(date_text="8.27", performer="泽拉黛", venue="MAO")]
         artists = [PlaylistArtist(name="Zella Day", song_count=1, sample_songs=["Hypnotic"])]
         reviewer = FakeEmptyBatchReviewer(
@@ -229,10 +229,9 @@ class MatcherAiReviewTest(unittest.TestCase):
 
         matches = match_events_to_artists(events, artists, ai_reviewer=reviewer, ai_only=True)
 
-        self.assertEqual(len(matches), 1)
-        self.assertEqual(matches[0].artist_name, "Zella Day")
+        self.assertEqual(matches, [])
         self.assertEqual(reviewer.batch_calls, 1)
-        self.assertEqual(reviewer.find_calls, 1)
+        self.assertEqual(reviewer.find_calls, 0)
 
     def test_ai_only_mode_skips_per_event_fallback_after_large_batch(self):
         events = [

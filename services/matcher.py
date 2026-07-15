@@ -44,9 +44,6 @@ WEAK_TOKENS = {
     "\u4e13\u573a",
 }
 
-AI_ONLY_SINGLE_FALLBACK_EVENT_LIMIT = 20
-
-
 @dataclass(frozen=True)
 class Alias:
     value: str
@@ -117,6 +114,13 @@ def event_aliases(performer: str) -> list[Alias]:
 
     for alias in ALIASES.get(cleaned, []) + ALIASES.get(no_paren, []):
         _add_alias(aliases, alias, "\u5e38\u89c1\u522b\u540d/\u8bd1\u540d")
+
+    input_keys = {normalize_name(cleaned), normalize_name(no_paren)}
+    for canonical_name, known_aliases in ALIASES.items():
+        identity_group = [canonical_name, *known_aliases]
+        if any(normalize_name(name) in input_keys for name in identity_group):
+            for name in identity_group:
+                _add_alias(aliases, name, "\u5e38\u89c1\u522b\u540d/\u8bd1\u540d")
 
     split_source = re.sub(r"\u5609\u5bbe[:\uff1a]?", "/", cleaned)
     split_source = re.sub(r"\b(feat\.?|ft\.|with)\b", "/", split_source, flags=re.I)
@@ -214,7 +218,7 @@ def _match_ai_only_with_exact_anchors(
             remaining_artists,
             event_indices=unresolved_indices,
         )
-    allow_single_fallback = batch_suggestions is None or len(unresolved_events) <= AI_ONLY_SINGLE_FALLBACK_EVENT_LIMIT
+    allow_single_fallback = batch_suggestions is None
 
     raw_matches = [_match_from_exact_anchor(events[event_index], artist) for event_index, artist in anchors.items()]
     for event_index, event in zip(unresolved_indices, unresolved_events):

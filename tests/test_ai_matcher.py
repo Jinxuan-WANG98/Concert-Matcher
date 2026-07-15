@@ -16,6 +16,7 @@ from services.ai_matcher import (
     parse_ai_decision,
     parse_ai_match_suggestion,
     AiArtistReviewer,
+    build_event_candidate_shortlists,
     _merge_suggestions,
 )
 from services.models import EventRow, PlaylistArtist
@@ -65,17 +66,91 @@ class AiMatcherTest(unittest.TestCase):
             model="text-model",
         )
 
-        self.assertTrue(config.cache_source.startswith("ai-match:v8:"))
+        self.assertTrue(config.cache_source.startswith("ai-match:v9:"))
 
     def test_config_defaults_bound_calls_and_use_two_workers(self):
         config = AiMatchConfig()
 
         self.assertEqual(config.candidate_limit, 200)
         self.assertEqual(config.timeout_seconds, 90)
-        self.assertEqual(config.event_batch_size, 40)
+        self.assertEqual(config.event_batch_size, 20)
+        self.assertEqual(config.shortlist_per_event, 5)
         self.assertEqual(config.event_workers, 2)
         self.assertEqual(config.max_calls, 30)
         self.assertEqual(config.max_elapsed_seconds, 600)
+
+    def test_config_loads_shortlist_per_event(self):
+        old_value = os.environ.pop("AI_MATCH_SHORTLIST_PER_EVENT", None)
+        try:
+            os.environ["AI_MATCH_SHORTLIST_PER_EVENT"] = "7"
+            config = AiMatchConfig.from_env()
+        finally:
+            if old_value is None:
+                os.environ.pop("AI_MATCH_SHORTLIST_PER_EVENT", None)
+            else:
+                os.environ["AI_MATCH_SHORTLIST_PER_EVENT"] = old_value
+
+        self.assertEqual(config.shortlist_per_event, 7)
+
+    def test_shortlists_prioritize_alias_and_ocr_equivalent_names(self):
+        events = [
+            EventRow(date_text="9.01", performer="周华健", venue="MAO"),
+            EventRow(date_text="9.12", performer="VoX LoW", venue="星在"),
+        ]
+        artists = [
+            PlaylistArtist(name="Unrelated Artist", song_count=1, sample_songs=[]),
+            PlaylistArtist(name="Wakin Chau", song_count=10, sample_songs=[]),
+            PlaylistArtist(name="Vox Low", song_count=8, sample_songs=[]),
+            PlaylistArtist(name="Another Guest", song_count=1, sample_songs=[]),
+        ]
+
+        shortlists = build_event_candidate_shortlists(
+            events,
+            artists,
+            event_indices=[11, 12],
+            per_event_limit=2,
+        )
+
+        self.assertEqual(shortlists[11][0].name, "Wakin Chau")
+        self.assertEqual(shortlists[12][0].name, "Vox Low")
+        self.assertEqual(len(shortlists[11]), 2)
+        self.assertEqual(len(shortlists[12]), 2)
+
+    def test_shortlists_expand_known_bilingual_aliases_in_both_directions(self):
+        event = EventRow(date_text="9.01", performer="Wakin Chau", venue="MAO")
+        artists = [
+            PlaylistArtist(name=name, song_count=1, sample_songs=[])
+            for name in ["Charlie", "Echo", "Alpha", "Bravo", "Delta", "周华健"]
+        ]
+
+        shortlist = build_event_candidate_shortlists([event], artists, [0], 5)[0]
+
+        self.assertEqual(shortlist[0].name, "周华健")
+
+    def test_shortlists_keep_adjacent_transposition_spelling_candidate(self):
+        event = EventRow(date_text="9.01", performer="ABCD", venue="MAO")
+        artists = [
+            PlaylistArtist(name=name, song_count=1, sample_songs=[])
+            for name in ["AAAA", "AAAB", "AABB", "AACC", "AADD", "ACBD"]
+        ]
+
+        shortlist = build_event_candidate_shortlists([event], artists, [0], 5)[0]
+
+        self.assertEqual(shortlist[0].name, "ACBD")
+
+    def test_shortlists_are_deterministic_when_similarity_is_equal(self):
+        event = EventRow(date_text="9.01", performer="No Lexical Signal", venue="MAO")
+        artists = [
+            PlaylistArtist(name="Zulu", song_count=1, sample_songs=[]),
+            PlaylistArtist(name="Alpha", song_count=1, sample_songs=[]),
+            PlaylistArtist(name="Bravo", song_count=1, sample_songs=[]),
+        ]
+
+        first = build_event_candidate_shortlists([event], artists, [0], 2)
+        second = build_event_candidate_shortlists([event], list(reversed(artists)), [0], 2)
+
+        self.assertEqual([artist.name for artist in first[0]], [artist.name for artist in second[0]])
+        self.assertEqual(len(first[0]), 2)
 
     def test_config_loads_call_and_elapsed_budgets(self):
         names = [
@@ -253,6 +328,30 @@ class AiMatcherTest(unittest.TestCase):
         self.assertIn("Zella Day", content)
         self.assertIn("matches", payload["messages"][0]["content"])
 
+    def test_batch_payload_can_scope_candidates_per_event(self):
+        events = [
+            EventRow(date_text="8.27", performer="ZeIIa Day", venue="MAO"),
+            EventRow(date_text="9.01", performer="PREP", venue="Modern Sky"),
+        ]
+        artists = [
+            PlaylistArtist(name="Zella Day", song_count=1, sample_songs=[]),
+            PlaylistArtist(name="PREP", song_count=2, sample_songs=[]),
+        ]
+
+        payload = build_batch_artist_pick_payload(
+            events,
+            artists,
+            model="text-model",
+            event_indices=[10, 11],
+            candidate_names_by_event_index={10: ["Zella Day"], 11: ["PREP"]},
+        )
+        user = json.loads(payload["messages"][-1]["content"].split("JSON:\n", 1)[1])
+
+        self.assertNotIn("playlist_candidates", user)
+        self.assertEqual(user["events"][0]["candidate_names"], ["Zella Day"])
+        self.assertEqual(user["events"][1]["candidate_names"], ["PREP"])
+        self.assertIn("candidate_names", payload["messages"][0]["content"])
+
     def test_batch_payload_uses_explicit_original_event_indices(self):
         events = [
             EventRow(date_text="9.6", performer="叶琼琳", venue="新歌空间"),
@@ -311,6 +410,32 @@ class AiMatcherTest(unittest.TestCase):
 
         self.assertEqual(suggestions[116].event_performer, "VoX LoW")
 
+    def test_parse_ai_batch_match_suggestions_accepts_glm_nested_event_matches(self):
+        suggestions = parse_ai_batch_match_suggestions(
+            json.dumps(
+                {
+                    "events": [
+                        {
+                            "event_index": 101,
+                            "event_performer": "山形瑞秋Rachael Yamagata",
+                            "candidate_names": ["Rachael Yamagata", "AGA"],
+                            "matches": [
+                                {
+                                    "artist_name": "Rachael Yamagata",
+                                    "confidence": "高",
+                                    "reason": "same identity",
+                                }
+                            ],
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        )
+
+        self.assertEqual(suggestions[101].artist_name, "Rachael Yamagata")
+        self.assertEqual(suggestions[101].event_performer, "山形瑞秋Rachael Yamagata")
+
     def test_reviewer_rejects_unknown_index_and_mismatched_performer(self):
         config = AiMatchConfig(
             enabled=True,
@@ -350,6 +475,92 @@ class AiMatcherTest(unittest.TestCase):
         )
 
         self.assertEqual(suggestions, {})
+
+    def test_reviewer_rejects_artist_outside_the_events_shortlist(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+            shortlist_per_event=1,
+            event_batch_size=2,
+            event_workers=1,
+        )
+        reviewer = AiArtistReviewer(config)
+
+        def cross_event_answer(payload):
+            user = json.loads(payload["messages"][-1]["content"].split("JSON:\n", 1)[1])
+            first_candidate = user["events"][0]["candidate_names"][0]
+            second_candidate = user["events"][1]["candidate_names"][0]
+            self.assertNotEqual(first_candidate, second_candidate)
+            return json.dumps(
+                {
+                    "matches": [
+                        {
+                            "event_index": 10,
+                            "event_performer": "Alpha",
+                            "artist_name": second_candidate,
+                            "confidence": "高",
+                            "reason": "candidate from another event",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+
+        reviewer._chat_content = cross_event_answer
+        suggestions = reviewer.find_best_matches(
+            [
+                EventRow(date_text="9.01", performer="Alpha", venue="MAO"),
+                EventRow(date_text="9.02", performer="Beta", venue="MAO"),
+            ],
+            [
+                PlaylistArtist(name="Alpha", song_count=1, sample_songs=[]),
+                PlaylistArtist(name="Beta", song_count=1, sample_songs=[]),
+                PlaylistArtist(name="Noise", song_count=1, sample_songs=[]),
+            ],
+            event_indices=[10, 11],
+        )
+
+        self.assertEqual(suggestions, {})
+
+    def test_large_reviewer_plan_uses_one_shortlisted_call_per_event_batch(self):
+        config = AiMatchConfig(
+            enabled=True,
+            api_key="test-key",
+            base_url="https://api.example.com/v1",
+            model="text-model",
+            shortlist_per_event=5,
+            candidate_limit=200,
+            event_batch_size=20,
+            event_workers=1,
+            max_calls=30,
+        )
+        reviewer = AiArtistReviewer(config)
+        payloads = []
+
+        def fake_chat(payload):
+            payloads.append(json.loads(payload["messages"][-1]["content"].split("JSON:\n", 1)[1]))
+            return '{"matches":[]}'
+
+        reviewer._chat_content = fake_chat
+        events = [
+            EventRow(date_text=f"9.{index + 1}", performer=f"Artist {index}", venue="MAO")
+            for index in range(177)
+        ]
+        artists = [
+            PlaylistArtist(name=f"Artist {index}", song_count=1, sample_songs=[])
+            for index in range(592)
+        ]
+
+        reviewer.find_best_matches(events, artists)
+
+        self.assertEqual(len(payloads), 9)
+        self.assertEqual(sum(len(payload["events"]) for payload in payloads), 177)
+        self.assertTrue(
+            all(len(event["candidate_names"]) == 5 for payload in payloads for event in payload["events"])
+        )
+        self.assertTrue(all("playlist_candidates" not in payload for payload in payloads))
 
     def test_reviewer_batches_event_matching_requests(self):
         config = AiMatchConfig(
@@ -393,7 +604,7 @@ class AiMatcherTest(unittest.TestCase):
         self.assertEqual(suggestions[1].artist_name, "PREP")
         self.assertEqual(suggestions[2].artist_name, "Hanser")
 
-    def test_reviewer_sends_all_compact_candidates_once_per_large_event_batch(self):
+    def test_reviewer_sends_event_specific_candidates_once_per_large_event_batch(self):
         config = AiMatchConfig(
             enabled=True,
             api_key="test-key",
@@ -424,23 +635,16 @@ class AiMatcherTest(unittest.TestCase):
 
         suggestions = reviewer.find_best_matches(events, artists)
 
-        # 51 events / batch 2 => 26 calls; all five compact candidates fit every call.
+        # 51 events / batch 2 => 26 calls; every event carries only its own shortlist.
         self.assertEqual(len(calls), 26)
         self.assertTrue(all(len(item["events"]) <= 2 for item in calls))
-        self.assertEqual(
-            calls[0]["playlist_candidates"],
-            [
-                {"name": "Artist 0"},
-                {"name": "Artist 1"},
-                {"name": "Artist 2"},
-                {"name": "Artist 3"},
-                {"name": "Artist 4"},
-            ],
-        )
+        self.assertNotIn("playlist_candidates", calls[0])
+        self.assertEqual(len(calls[0]["events"][0]["candidate_names"]), 5)
+        self.assertEqual(calls[0]["events"][0]["candidate_names"][0], "Artist 0")
         self.assertEqual([item["event_index"] for item in calls[0]["events"]], [0, 1])
         self.assertEqual(suggestions[4].artist_name, "Artist 4")
 
-    def test_reviewer_uses_compact_candidates_for_normal_event_batches(self):
+    def test_reviewer_uses_event_specific_candidates_for_normal_event_batches(self):
         config = AiMatchConfig(
             enabled=True,
             api_key="test-key",
@@ -464,7 +668,8 @@ class AiMatcherTest(unittest.TestCase):
             [PlaylistArtist(name="PREP", song_count=20, sample_songs=["Cheapest Flight"])],
         )
 
-        self.assertEqual(payloads[0]["playlist_candidates"], [{"name": "PREP"}])
+        self.assertNotIn("playlist_candidates", payloads[0])
+        self.assertEqual(payloads[0]["events"][0]["candidate_names"], ["PREP"])
 
     def test_timeout_candidate_split_stops_after_one_recovery_level(self):
         config = AiMatchConfig(
@@ -768,7 +973,7 @@ class AiMatcherTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(second[0].artist_name, "Zella Day")
 
-    def test_reviewer_checks_artist_candidate_chunks_beyond_first_limit(self):
+    def test_reviewer_shortlist_finds_artist_beyond_candidate_limit(self):
         config = AiMatchConfig(
             enabled=True,
             api_key="test-key",
@@ -784,7 +989,7 @@ class AiMatcherTest(unittest.TestCase):
         def fake_chat(payload):
             content = payload["messages"][-1]["content"]
             data = json.loads(content.split("JSON:\n", 1)[1])
-            candidates = [item["name"] for item in data["playlist_candidates"]]
+            candidates = data["events"][0]["candidate_names"]
             candidate_batches.append(candidates)
             if "Late Artist" not in candidates:
                 return '{"matches":[{"event_index":0,"artist_name":null,"confidence":"\u4f4e","reason":"no"}]}'
@@ -801,13 +1006,11 @@ class AiMatcherTest(unittest.TestCase):
 
         suggestions = reviewer.find_best_matches(events, artists)
 
-        self.assertEqual(
-            candidate_batches,
-            [["Artist 1", "Artist 2"], ["Artist 3", "Late Artist"]],
-        )
+        self.assertEqual(len(candidate_batches), 1)
+        self.assertEqual(candidate_batches[0][0], "Late Artist")
         self.assertEqual(suggestions[0].artist_name, "Late Artist")
 
-    def test_reviewer_single_match_checks_artist_candidates_beyond_first_limit(self):
+    def test_reviewer_single_match_uses_ranked_shortlist(self):
         config = AiMatchConfig(
             enabled=True,
             api_key="test-key",
@@ -823,7 +1026,7 @@ class AiMatcherTest(unittest.TestCase):
         def fake_chat(payload):
             content = payload["messages"][-1]["content"]
             data = json.loads(content.split("JSON:\n", 1)[1])
-            candidates = [item["name"] for item in data["playlist_candidates"]]
+            candidates = data["events"][0]["candidate_names"]
             candidate_batches.append(candidates)
             if "Late Artist" not in candidates:
                 return '{"matches":[{"event_index":0,"artist_name":null,"confidence":"低","reason":"no"}]}'
@@ -840,10 +1043,8 @@ class AiMatcherTest(unittest.TestCase):
 
         suggestion = reviewer.find_best_match(event, artists)
 
-        self.assertEqual(
-            candidate_batches,
-            [["Artist 1", "Artist 2"], ["Artist 3", "Late Artist"]],
-        )
+        self.assertEqual(len(candidate_batches), 1)
+        self.assertEqual(candidate_batches[0][0], "Late Artist")
         self.assertEqual(suggestion.artist_name, "Late Artist")
 
     def test_reviewer_splits_artist_candidates_when_single_event_times_out(self):
@@ -862,7 +1063,7 @@ class AiMatcherTest(unittest.TestCase):
         def fake_chat(payload):
             content = payload["messages"][-1]["content"]
             data = json.loads(content.split("JSON:\n", 1)[1])
-            candidates = [item["name"] for item in data["playlist_candidates"]]
+            candidates = data["events"][0]["candidate_names"]
             candidate_batches.append(candidates)
             if len(candidates) == 4:
                 raise TimeoutError("The read operation timed out")
@@ -881,14 +1082,9 @@ class AiMatcherTest(unittest.TestCase):
 
         suggestions = reviewer.find_best_matches(events, artists)
 
-        self.assertEqual(
-            candidate_batches,
-            [
-                ["Artist 1", "Artist 2", "Artist 3", "Late Artist"],
-                ["Artist 1", "Artist 2"],
-                ["Artist 3", "Late Artist"],
-            ],
-        )
+        self.assertEqual([len(batch) for batch in candidate_batches], [4, 2, 2])
+        self.assertEqual(candidate_batches[0][0], "Late Artist")
+        self.assertEqual(candidate_batches[1] + candidate_batches[2], candidate_batches[0])
         self.assertEqual(suggestions[0].artist_name, "Late Artist")
 
     def test_reviewer_repairs_malformed_batch_match_json_with_ai(self):
