@@ -80,6 +80,8 @@ services:
         value: "true"
       - key: AI_OCR_PROVIDER_FALLBACK
         value: "true"
+      - key: AI_OCR_TRANSIENT_RETRY_ATTEMPTS
+        value: "1"
       - key: AI_OCR_TIMEOUT_SECONDS
         value: "90"
       - key: AI_OCR_LOCAL_FALLBACK

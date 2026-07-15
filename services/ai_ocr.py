@@ -54,6 +54,7 @@ class AiOcrConfig:
     dual_provider: bool = False
     jpeg_quality: int = 85
     low_result_threshold: int = 3
+    transient_retry_attempts: int = 1
 
     @classmethod
     def from_env(cls) -> "AiOcrConfig":
@@ -85,6 +86,7 @@ class AiOcrConfig:
             dual_provider=dual_provider,
             jpeg_quality=max(60, min(95, int(os.environ.get("AI_OCR_JPEG_QUALITY", "88")))),
             low_result_threshold=max(1, int(os.environ.get("AI_OCR_LOW_RESULT_THRESHOLD", "3"))),
+            transient_retry_attempts=max(0, min(1, int(os.environ.get("AI_OCR_TRANSIENT_RETRY_ATTEMPTS", "1")))),
         )
 
     @property
@@ -536,6 +538,24 @@ def _low_result_attempts_agree(results: list[AiOcrProviderResult]) -> bool:
     return bool(reference) and all(_event_keys(result.events) == reference for result in results[1:])
 
 
+def _is_transient_ocr_error(error: str) -> bool:
+    normalized = str(error or "").lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "timed out",
+            "timeout",
+            "connection reset",
+            "connection aborted",
+            "temporarily unavailable",
+            "service unavailable",
+            "too many requests",
+            "rate limit",
+            "http error 5",
+        )
+    ) or bool(re.search(r"\b5\d{2}\b", normalized))
+
+
 def _extract_batch_with_provider_fallback(
     batch: list[Path],
     providers: tuple[AiOcrProviderConfig, ...],
@@ -638,7 +658,7 @@ def extract_events_with_ai_ocr(image_paths: list[Path], warnings: list[str]) -> 
         )
 
         results_by_batch: dict[int, AiOcrProviderResult] = {}
-        failed_batches: list[int] = []
+        failed_results_by_batch: dict[int, AiOcrProviderResult] = {}
         batches = list(_chunked(image_paths, config.image_batch_size))
         worker_count = min(max(1, config.image_workers), len(batches))
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
@@ -660,11 +680,10 @@ def extract_events_with_ai_ocr(image_paths: list[Path], warnings: list[str]) -> 
                     error = describe_ai_exception(exc)
                     result = AiOcrProviderResult(provider_name="batch", events=[], error=error)
                 if result.error:
-                    failed_batches.append(batch_index)
-                    warnings.append(f"AI \u8bc6\u522b\u5931\u8d25\uff08{result.provider_name}\uff09\uff1a{result.error}")
+                    failed_results_by_batch[batch_index] = result
                     debug_log(
                         "ai_ocr.py:extract_events_with_ai_ocr",
-                        "ai ocr batch failed",
+                        "ai ocr batch requires recovery",
                         {"batchIndex": batch_index, "provider": result.provider_name, "error": result.error},
                         hypothesis_id="H3",
                     )
@@ -679,7 +698,58 @@ def extract_events_with_ai_ocr(image_paths: list[Path], warnings: list[str]) -> 
                         "eventCount": len(result.events),
                     },
                     hypothesis_id="H1",
-                )
+                    )
+
+        retry_count = 0
+        for batch_index in sorted(failed_results_by_batch):
+            result = failed_results_by_batch[batch_index]
+            if retry_count >= config.transient_retry_attempts or not _is_transient_ocr_error(result.error):
+                continue
+            retry_count += 1
+            debug_log(
+                "ai_ocr.py:extract_events_with_ai_ocr",
+                "retrying transient ocr batch sequentially",
+                {
+                    "batchIndex": batch_index,
+                    "attempt": retry_count,
+                    "provider": result.provider_name,
+                    "error": result.error,
+                },
+                hypothesis_id="H3",
+            )
+            retry_result = _extract_batch_with_provider_fallback(
+                batches[batch_index],
+                config.providers,
+                batch_index + retry_count,
+                config,
+            )
+            if retry_result.error:
+                failed_results_by_batch[batch_index] = retry_result
+                continue
+            results_by_batch[batch_index] = retry_result
+            del failed_results_by_batch[batch_index]
+            debug_log(
+                "ai_ocr.py:extract_events_with_ai_ocr",
+                "transient ocr batch recovered",
+                {
+                    "batchIndex": batch_index,
+                    "attempt": retry_count,
+                    "provider": retry_result.provider_name,
+                    "eventCount": len(retry_result.events),
+                },
+                hypothesis_id="H3",
+            )
+
+        failed_batches = sorted(failed_results_by_batch)
+        for batch_index in failed_batches:
+            result = failed_results_by_batch[batch_index]
+            warnings.append(f"AI \u8bc6\u522b\u5931\u8d25\uff08{result.provider_name}\uff09\uff1a{result.error}")
+            debug_log(
+                "ai_ocr.py:extract_events_with_ai_ocr",
+                "ai ocr batch failed",
+                {"batchIndex": batch_index, "provider": result.provider_name, "error": result.error},
+                hypothesis_id="H3",
+            )
 
         results = [results_by_batch[index] for index in sorted(results_by_batch)]
         timer.data["successfulBatches"] = len(results)

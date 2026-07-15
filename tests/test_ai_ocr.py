@@ -35,6 +35,7 @@ class AiOcrTest(unittest.TestCase):
             "AI_OCR_LOCAL_FALLBACK",
             "AI_OCR_DUAL_PROVIDER",
             "AI_OCR_PROVIDER_FALLBACK",
+            "AI_OCR_TRANSIENT_RETRY_ATTEMPTS",
         ]
         for index in range(1, 5):
             names.extend(
@@ -87,6 +88,21 @@ class AiOcrTest(unittest.TestCase):
         self.assertEqual([provider.name for provider in config.providers], ["siliconflow", "zhipu"])
         self.assertIn("siliconflow:sf-vl", config.cache_source)
         self.assertIn("zhipu:glm-v", config.cache_source)
+
+    def test_config_defaults_to_one_transient_retry_attempt(self):
+        old_values = self._clear_ai_ocr_env()
+        try:
+            os.environ["AI_OCR_ENABLED"] = "true"
+            os.environ["AI_OCR_PROVIDER_1_NAME"] = "siliconflow"
+            os.environ["AI_OCR_PROVIDER_1_API_KEY"] = "sf-key"
+            os.environ["AI_OCR_PROVIDER_1_BASE_URL"] = "https://api.siliconflow.cn/v1"
+            os.environ["AI_OCR_PROVIDER_1_MODEL"] = "sf-vl"
+
+            config = AiOcrConfig.from_env()
+        finally:
+            self._restore_env(old_values)
+
+        self.assertEqual(config.transient_retry_attempts, 1)
 
     def test_config_skips_disabled_ai_ocr_provider(self):
         old_values = self._clear_ai_ocr_env()
@@ -333,7 +349,7 @@ class AiOcrTest(unittest.TestCase):
             os.environ["AI_OCR_PROVIDER_1_MODEL"] = "vision-model"
 
             def fake_extract(batch, providers, batch_index, config):
-                if batch_index == 1:
+                if batch[0].name == "two.jpg":
                     return AiOcrProviderResult(provider_name="test", events=[], error="timed out")
                 return AiOcrProviderResult(
                     provider_name="test",
@@ -556,6 +572,108 @@ class AiOcrTest(unittest.TestCase):
         finally:
             ai_ocr.AiOcrClient._extract_batch_events = original_extract
             self._restore_env(old_values)
+
+    def test_extract_events_with_ai_ocr_recovers_one_transient_failed_batch(self):
+        old_values = self._clear_ai_ocr_env()
+        original_extract = ai_ocr._extract_batch_with_provider_fallback
+        calls = []
+        warnings = []
+        try:
+            os.environ["AI_OCR_ENABLED"] = "true"
+            os.environ["AI_OCR_IMAGE_BATCH_SIZE"] = "1"
+            os.environ["AI_OCR_IMAGE_WORKERS"] = "1"
+            os.environ["AI_OCR_PROVIDER_FALLBACK"] = "true"
+            os.environ["AI_OCR_PROVIDER_1_NAME"] = "siliconflow"
+            os.environ["AI_OCR_PROVIDER_1_API_KEY"] = "sf-key"
+            os.environ["AI_OCR_PROVIDER_1_BASE_URL"] = "https://api.siliconflow.cn/v1"
+            os.environ["AI_OCR_PROVIDER_1_MODEL"] = "sf-vl"
+            os.environ["AI_OCR_PROVIDER_2_NAME"] = "zhipu"
+            os.environ["AI_OCR_PROVIDER_2_API_KEY"] = "zp-key"
+            os.environ["AI_OCR_PROVIDER_2_BASE_URL"] = "https://api.example.com/v1"
+            os.environ["AI_OCR_PROVIDER_2_MODEL"] = "zp-vl"
+
+            def fake_extract(batch, providers, start_index, config):
+                calls.append(start_index)
+                if len(calls) == 1:
+                    return AiOcrProviderResult(
+                        provider_name="siliconflow,zhipu",
+                        events=[],
+                        error="zhipu: The read operation timed out; siliconflow: The read operation timed out",
+                    )
+                return AiOcrProviderResult(
+                    provider_name="zhipu",
+                    events=[EventRow(date_text="9.12", performer="VoX LoW", venue="星在")],
+                )
+
+            ai_ocr._extract_batch_with_provider_fallback = fake_extract
+            events = ai_ocr.extract_events_with_ai_ocr([Path("schedule.jpg")], warnings)
+        finally:
+            ai_ocr._extract_batch_with_provider_fallback = original_extract
+            self._restore_env(old_values)
+
+        self.assertEqual(calls, [0, 1])
+        self.assertEqual(
+            [(event.date_text, event.performer, event.venue) for event in events],
+            [("9.12", "VoX LoW", "星在")],
+        )
+        self.assertFalse(any("失败" in warning for warning in warnings))
+
+    def test_extract_events_with_ai_ocr_does_not_retry_non_transient_failure(self):
+        old_values = self._clear_ai_ocr_env()
+        original_extract = ai_ocr._extract_batch_with_provider_fallback
+        calls = []
+        try:
+            os.environ["AI_OCR_ENABLED"] = "true"
+            os.environ["AI_OCR_IMAGE_BATCH_SIZE"] = "1"
+            os.environ["AI_OCR_IMAGE_WORKERS"] = "1"
+            os.environ["AI_OCR_PROVIDER_1_NAME"] = "siliconflow"
+            os.environ["AI_OCR_PROVIDER_1_API_KEY"] = "sf-key"
+            os.environ["AI_OCR_PROVIDER_1_BASE_URL"] = "https://api.siliconflow.cn/v1"
+            os.environ["AI_OCR_PROVIDER_1_MODEL"] = "sf-vl"
+
+            def fake_extract(batch, providers, start_index, config):
+                calls.append(start_index)
+                return AiOcrProviderResult(provider_name="siliconflow", events=[], error="HTTP Error 403: Forbidden")
+
+            ai_ocr._extract_batch_with_provider_fallback = fake_extract
+            with self.assertRaisesRegex(ai_ocr.AiOcrIncompleteError, "1/1"):
+                ai_ocr.extract_events_with_ai_ocr([Path("schedule.jpg")], [])
+        finally:
+            ai_ocr._extract_batch_with_provider_fallback = original_extract
+            self._restore_env(old_values)
+
+        self.assertEqual(calls, [0])
+
+    def test_extract_events_with_ai_ocr_retries_at_most_one_failed_batch_per_task(self):
+        old_values = self._clear_ai_ocr_env()
+        original_extract = ai_ocr._extract_batch_with_provider_fallback
+        calls = []
+        try:
+            os.environ["AI_OCR_ENABLED"] = "true"
+            os.environ["AI_OCR_IMAGE_BATCH_SIZE"] = "1"
+            os.environ["AI_OCR_IMAGE_WORKERS"] = "1"
+            os.environ["AI_OCR_PROVIDER_1_NAME"] = "siliconflow"
+            os.environ["AI_OCR_PROVIDER_1_API_KEY"] = "sf-key"
+            os.environ["AI_OCR_PROVIDER_1_BASE_URL"] = "https://api.siliconflow.cn/v1"
+            os.environ["AI_OCR_PROVIDER_1_MODEL"] = "sf-vl"
+
+            def fake_extract(batch, providers, start_index, config):
+                calls.append((batch[0].name, start_index))
+                if len(calls) <= 2:
+                    return AiOcrProviderResult(provider_name="siliconflow", events=[], error="The read operation timed out")
+                return AiOcrProviderResult(
+                    provider_name="siliconflow",
+                    events=[EventRow(date_text="9.12", performer="VoX LoW", venue="星在")],
+                )
+
+            ai_ocr._extract_batch_with_provider_fallback = fake_extract
+            with self.assertRaisesRegex(ai_ocr.AiOcrIncompleteError, "1/2"):
+                ai_ocr.extract_events_with_ai_ocr([Path("first.jpg"), Path("second.jpg")], [])
+        finally:
+            ai_ocr._extract_batch_with_provider_fallback = original_extract
+            self._restore_env(old_values)
+
+        self.assertEqual(calls, [("first.jpg", 0), ("second.jpg", 1), ("first.jpg", 1)])
 
 
 if __name__ == "__main__":

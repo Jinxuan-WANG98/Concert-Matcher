@@ -33,6 +33,7 @@ class RenderConfigTest(unittest.TestCase):
             "AI_OCR_IMAGE_WORKERS": "3",
             "AI_OCR_MAX_WIDTH": "1200",
             "AI_OCR_PROVIDER_FALLBACK": "true",
+            "AI_OCR_TRANSIENT_RETRY_ATTEMPTS": "1",
             "AI_OCR_LOCAL_FALLBACK": "false",
         }
         for key, value in expected.items():
@@ -63,6 +64,7 @@ class RenderConfigTest(unittest.TestCase):
             "AI_OCR_IMAGE_WORKERS": "3",
             "AI_OCR_MAX_WIDTH": "1200",
             "AI_OCR_PROVIDER_FALLBACK": "true",
+            "AI_OCR_TRANSIENT_RETRY_ATTEMPTS": "1",
             "AI_OCR_LOCAL_FALLBACK": "false",
         }
         for key, value in expected.items():
